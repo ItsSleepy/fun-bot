@@ -1,0 +1,15 @@
+[Unit]
+Description=Fun/economy bot (shared currency system)
+After=network.target
+
+[Service]
+Type=simple
+User=sleepy
+WorkingDirectory=/home/sleepy/fun-bot
+EnvironmentFile=/home/sleepy/fun-bot/.env
+ExecStart=/home/sleepy/.nvm/versions/node/v24.20.0/bin/node /home/sleepy/fun-bot/index.js
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

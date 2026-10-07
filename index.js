@@ -422,6 +422,8 @@ function getActivePets(userId) {
 function setActivePet(userId, petId, slot = 1) {
   const user = getUser(userId);
   const maxSlot = Math.max(1, Math.min(slot, user.pet_slots));
+  // a pet can only occupy one slot — otherwise equipping it twice would double its buff
+  db.prepare('DELETE FROM active_pets WHERE user_id = ? AND pet_id = ? AND slot_index != ?').run(userId, petId, maxSlot);
   db.prepare('INSERT INTO active_pets (user_id, slot_index, pet_id) VALUES (?, ?, ?) ON CONFLICT(user_id, slot_index) DO UPDATE SET pet_id = excluded.pet_id')
     .run(userId, maxSlot, petId);
 }
@@ -788,6 +790,20 @@ function petPower(pet) {
   return pet.level * (10 + buffSum);
 }
 
+// Returns an error message if the battle can't go ahead fairly, or null if it can.
+function battleProblem(challengerId, opponentId, challengerPetId, opponentPetId, wager) {
+  const cPet = getPet(challengerPetId);
+  if (!cPet || cPet.user_id !== challengerId) return "The challenger's pet is no longer theirs — battle cancelled.";
+  if (opponentPetId != null) {
+    const oPet = getPet(opponentPetId);
+    if (!oPet || oPet.user_id !== opponentId) return "That pet isn't yours anymore.";
+  }
+  if (wager > 0) {
+    if (getUser(challengerId).balance < wager) return `The challenger no longer has ${fmt(wager)} to cover the wager — battle cancelled.`;
+    if (getUser(opponentId).balance < wager) return `You need ${fmt(wager)} to accept this wager.`;
+  }
+  return null;
+}
 function resolveBattle(challengerId, opponentId, challengerPetId, opponentPetId, wager) {
   const challengerPet = getPet(challengerPetId);
   const opponentPet = getPet(opponentPetId);
@@ -801,7 +817,7 @@ function resolveBattle(challengerId, opponentId, challengerPetId, opponentPetId,
   if (wager > 0) {
     const winnerBal = getUser(winnerId).balance;
     const loserBal = getUser(loserId).balance;
-    if (loserBal >= wager) {
+    if (loserBal >= wager) { // always true: battleProblem() checks both balances right before this runs
       addBalance(loserId, -wager);
       addBalance(winnerId, wager);
       wagerPaid = wager;
@@ -958,6 +974,9 @@ async function purchaseItem(interaction, itemKey) {
 
   if (item.category === 'Pet Items') {
     if (item.effect === 'luck_charm') {
+      if (user.pending_luck_charm === 1) {
+        return interaction.reply({ content: '🍀 You already have a Luck Charm waiting — it applies to your next chest. Nothing was charged.', ephemeral: true });
+      }
       addBalance(interaction.user.id, -item.price);
       db.prepare('UPDATE users SET pending_luck_charm = 1 WHERE user_id = ?').run(interaction.user.id);
       return interaction.reply({ content: '🍀 Luck Charm active — your next chest purchase (Normal or Premium) gets improved odds.', ephemeral: true });
@@ -974,7 +993,6 @@ async function purchaseItem(interaction, itemKey) {
       return interaction.reply({ content: msg, ephemeral: true });
     }
 
-    addBalance(interaction.user.id, -item.price);
     const menu = new StringSelectMenuBuilder()
       .setCustomId(`pet_item_target_${item.key}`)
       .setPlaceholder('Choose a pet')
@@ -982,7 +1000,7 @@ async function purchaseItem(interaction, itemKey) {
         const c = petByKey(p.pet_key);
         return { label: `${c.name} (#${p.id}, Lv.${p.level})`, value: String(p.id) };
       }));
-    return interaction.reply({ content: `${item.name} purchased — pick a pet:`, components: [new ActionRowBuilder().addComponents(menu)], ephemeral: true });
+    return interaction.reply({ content: `Pick a pet for the ${item.name} — ${fmt(item.price)} is only charged once you choose:`, components: [new ActionRowBuilder().addComponents(menu)], ephemeral: true });
   }
 
   if (item.category === 'Upgrades') {
@@ -1188,7 +1206,7 @@ async function registerCommands() {
       .addIntegerOption(o => o.setName('amount').setDescription('Candy to feed it').setRequired(true).setMinValue(1)),
     new SlashCommandBuilder().setName('pet-equip').setDescription('Set an active pet — its buffs apply to you while equipped')
       .addIntegerOption(o => o.setName('id').setDescription('Pet ID (from /pets)').setRequired(true))
-      .addIntegerOption(o => o.setName('slot').setDescription('Which slot (only relevant if you own a 2nd slot)').addChoices({ name: '1', value: 1 }, { name: '2', value: 2 })),
+      .addIntegerOption(o => o.setName('slot').setDescription('Which slot (only relevant if you own a 2nd slot)').addChoices({ name: '1', value: 1 }, { name: '2', value: 2 }, { name: '3', value: 3 })),
     new SlashCommandBuilder().setName('shop').setDescription('Browse and buy tools, boosts, chests, and upgrades'),
     new SlashCommandBuilder().setName('inventory').setDescription('View your tools, active boosts, and pet slots'),
     new SlashCommandBuilder().setName('fish').setDescription('Go fishing (needs a Fishing Rod from /shop)'),
@@ -1256,6 +1274,13 @@ client.on('interactionCreate', async (interaction) => {
         await interaction.update({ content: 'This challenge is no longer active.', components: [] });
         return;
       }
+      const problem = battleProblem(offer.challengerId, offer.opponentId, offer.challengerPetId, opponentPetId, offer.wager);
+      if (problem) {
+        // a pet or wager issue on the challenger's side ends the challenge; an opponent-side issue lets them fix it and retry
+        if (problem.startsWith('The challenger')) { clearTimeout(offer.timeout); battleOffers.delete(offerId); }
+        await interaction.update({ content: problem, components: [] });
+        return;
+      }
       clearTimeout(offer.timeout);
       battleOffers.delete(offerId);
 
@@ -1295,12 +1320,17 @@ client.on('interactionCreate', async (interaction) => {
         return;
       }
       const catalog = petByKey(pet.pet_key);
+      if (item.effect === 'booster' && pet.booster_used) {
+        await interaction.update({ content: `${catalog.name} (#${petId}) already has a booster — nothing was charged. Pick a different pet from \`/shop\`.`, components: [] });
+        return;
+      }
+      if (getUser(interaction.user.id).balance < item.price) {
+        await interaction.update({ content: `You need ${fmt(item.price)} for the ${item.name} — nothing was charged.`, components: [] });
+        return;
+      }
+      addBalance(interaction.user.id, -item.price);
 
       if (item.effect === 'booster') {
-        if (pet.booster_used) {
-          await interaction.update({ content: `${catalog.name} (#${petId}) already has a booster — pick a different pet.`, components: [] });
-          return;
-        }
         // Boost whichever stat this pet already buffs the most (ties go xp > coin > win).
         const stats = ['xp', 'coin', 'win'];
         const best = stats.reduce((a, b) => (catalog.buff[b] > catalog.buff[a] ? b : a));
@@ -1392,6 +1422,8 @@ client.on('interactionCreate', async (interaction) => {
       const offer = battleOffers.get(offerId);
       if (!offer) { await interaction.reply({ content: 'This challenge is no longer active.', ephemeral: true }); return; }
       if (interaction.user.id !== offer.opponentId) { await interaction.reply({ content: "This challenge isn't for you.", ephemeral: true }); return; }
+      const acceptProblem = battleProblem(offer.challengerId, offer.opponentId, offer.challengerPetId, null, offer.wager);
+      if (acceptProblem) { await interaction.reply({ content: acceptProblem, ephemeral: true }); return; }
 
       const pets = getUserPets(interaction.user.id);
       const menu = new StringSelectMenuBuilder()
@@ -1568,7 +1600,7 @@ client.on('interactionCreate', async (interaction) => {
       .setDescription(`Ball landed on **${result}** ${colorEmoji}`)
       .setColor(won ? 0x4CAF50 : 0xE53935)
       .addFields(
-        { name: won ? '🎉 You won' : '💥 You lost', value: won ? fmt(winnings) : `Lost ${fmt(amount)}`, inline: true },
+        { name: won ? '🎉 You won' : '💥 You lost', value: won ? `+${fmt(winnings - amount)}` : `Lost ${fmt(amount)}`, inline: true },
         { name: 'New balance', value: fmt(newBalance), inline: true },
       );
     await interaction.reply({ embeds: [embed] });
@@ -1739,7 +1771,8 @@ client.on('interactionCreate', async (interaction) => {
     const result = Math.random() < 0.5 ? 'heads' : 'tails';
     const won = result === call;
     const buff = getActiveBuff(interaction.user.id);
-    if (won) addBalance(interaction.user.id, applyBuff(amount * 2, buff.win));
+    const payout = won ? applyBuff(amount * 2, buff.win) : 0;
+    if (won) addBalance(interaction.user.id, payout);
     const newBalance = getUser(interaction.user.id).balance;
 
     const embed = new EmbedBuilder()
@@ -1747,7 +1780,7 @@ client.on('interactionCreate', async (interaction) => {
       .setDescription(`Landed on **${result}**! You called **${call}**.`)
       .setColor(won ? 0x4CAF50 : 0xE53935)
       .addFields(
-        { name: won ? 'You won' : 'You lost', value: fmt(won ? amount : amount), inline: true },
+        { name: won ? 'You won' : 'You lost', value: won ? `+${fmt(payout - amount)}` : fmt(amount), inline: true },
         { name: 'New balance', value: fmt(newBalance), inline: true },
       );
     await interaction.reply({ embeds: [embed] });
@@ -1782,7 +1815,7 @@ client.on('interactionCreate', async (interaction) => {
       .setDescription(`**[ ${a.emoji} | ${b.emoji} | ${c.emoji} ]**`)
       .setColor(outcome === 'jackpot' ? 0xFFD700 : outcome === 'push' ? 0xFFC107 : 0xE53935)
       .addFields(
-        { name: outcome === 'jackpot' ? '🎉 Jackpot!' : outcome === 'push' ? '🤝 Push' : '💥 No match', value: outcome === 'lose' ? `Lost ${fmt(amount)}` : fmt(winnings), inline: true },
+        { name: outcome === 'jackpot' ? '🎉 Jackpot!' : outcome === 'push' ? '🤝 Push' : '💥 No match', value: outcome === 'lose' ? `Lost ${fmt(amount)}` : outcome === 'push' ? 'Bet returned' : `+${fmt(winnings - amount)}`, inline: true },
         { name: 'New balance', value: fmt(newBalance), inline: true },
       );
     await interaction.reply({ embeds: [embed] });
@@ -1821,15 +1854,22 @@ client.on('interactionCreate', async (interaction) => {
       return;
     }
 
+    blackjackGames.set(interaction.user.id, game); // claim the seat before awaiting Discord
     const embed = buildBlackjackEmbed(game);
-    const reply = await interaction.reply({ embeds: [embed], components: [buildBlackjackRow()], fetchReply: true });
+    let reply;
+    try {
+      reply = await interaction.reply({ embeds: [embed], components: [buildBlackjackRow()], fetchReply: true });
+    } catch (err) {
+      blackjackGames.delete(interaction.user.id);
+      addBalance(interaction.user.id, amount); // the table never appeared — give the bet back
+      throw err;
+    }
     game.messageId = reply.id;
     game.timeout = setTimeout(async () => {
       if (blackjackGames.has(interaction.user.id)) {
         try { await resolveBlackjack(game, { update: async (opts) => reply.edit(opts) }, false); } catch {}
       }
     }, 120000);
-    blackjackGames.set(interaction.user.id, game);
     return;
   }
 
@@ -2326,7 +2366,7 @@ client.on('interactionCreate', async (interaction) => {
     }
     const user = getUser(interaction.user.id);
     if (slot > user.pet_slots) {
-      await interaction.reply({ content: `You only have ${user.pet_slots} pet slot${user.pet_slots > 1 ? 's' : ''} — buy a 2nd slot from \`/shop\` to use slot 2.`, ephemeral: true });
+      await interaction.reply({ content: `You only have ${user.pet_slots} pet slot${user.pet_slots > 1 ? 's' : ''} — buy more pet slots from \`/shop\` (Upgrades) to use slot ${slot}.`, ephemeral: true });
       return;
     }
     setActivePet(interaction.user.id, id, slot);

@@ -1,3 +1,11 @@
+// Start every run from an empty test database, so leftovers from earlier runs
+// (e.g. the prestige test setting test_user_1 to prestige 5) can't skew results.
+{
+  const fs = require('fs'), p = require('path');
+  for (const f of ['economy.db', 'economy.db-wal', 'economy.db-shm']) {
+    try { fs.unlinkSync(p.join(__dirname, f)); } catch {}
+  }
+}
 const h = require('./harness.js');
 
 let pass = 0, fail = 0;
@@ -515,6 +523,41 @@ console.log('=== 27. Duel + roulette shop/economy isolation ===');
 }
 
 console.log('\n' + '='.repeat(50));
+
+console.log('=== 28. Audit fixes: pet slots, battles ===');
+{
+  // the same pet can't sit in two slots (would double its buff)
+  h.db.prepare('DELETE FROM active_pets WHERE user_id = ?').run(U1);
+  h.db.prepare('UPDATE users SET pet_slots = 3, prestige = 0 WHERE user_id = ?').run(U1);
+  const kit = h.addPetToUser(U1, 'kitten');
+  h.setActivePet(U1, kit, 1);
+  h.setActivePet(U1, kit, 2);
+  const rows = h.db.prepare('SELECT slot_index FROM active_pets WHERE user_id = ? AND pet_id = ?').all(U1, kit);
+  check('a pet occupies only one slot', rows.length === 1 && rows[0].slot_index === 2, JSON.stringify(rows));
+  check('re-equipping does not double the buff', h.getActiveBuff(U1).coin === 3, `got ${h.getActiveBuff(U1).coin}`);
+  const kit2 = h.addPetToUser(U1, 'kitten');
+  h.setActivePet(U1, kit2, 3);
+  check('slot 3 works once owned', h.db.prepare('SELECT pet_id FROM active_pets WHERE user_id = ? AND slot_index = 3').get(U1)?.pet_id === kit2);
+
+  // battles: ownership + wager coverage checked before resolving
+  const a = h.addPetToUser(U1, 'kitten'), b = h.addPetToUser(U2, 'kitten');
+  h.db.prepare('UPDATE users SET balance = 100 WHERE user_id IN (?, ?)').run(U1, U2);
+  check('valid battle has no problem', h.battleProblem(U1, U2, a, b, 50) === null);
+  h.db.prepare('UPDATE users SET balance = 1000 WHERE user_id = ?').run(U1);
+  check('broke opponent cannot accept a wager', /need/.test(h.battleProblem(U1, U2, a, b, 500) || ''));
+  h.db.prepare('UPDATE users SET balance = 100 WHERE user_id = ?').run(U1);
+  h.db.prepare('UPDATE users SET balance = 10 WHERE user_id = ?').run(U1);
+  check('broke challenger cancels the battle', /challenger no longer has/.test(h.battleProblem(U1, U2, a, b, 50) || ''));
+  h.db.prepare('UPDATE pets SET user_id = ? WHERE id = ?').run(U2, a);
+  check('challenger pet traded away cancels the battle', /no longer theirs/.test(h.battleProblem(U1, U2, a, b, 0) || ''));
+  check("opponent can't use someone else's pet", /isn't yours/.test(h.battleProblem(U2, U1, b, a, 0) || '') || h.battleProblem(U2, U1, b, a, 0) !== null);
+  h.db.prepare('UPDATE pets SET user_id = ? WHERE id = ?').run(U1, a);
+  h.db.prepare('UPDATE users SET balance = 100 WHERE user_id IN (?, ?)').run(U1, U2);
+  const r = h.resolveBattle(U1, U2, a, b, 40);
+  const bal = id => h.getUser(id).balance;
+  check('wager always moves winner +40 / loser -40', r.wagerPaid === 40 && bal(r.winnerId) === 140 && bal(r.loserId) === 60, `${bal(r.winnerId)}/${bal(r.loserId)}`);
+}
+
 console.log(`RESULTS: ${pass} passed, ${fail} failed (${pass + fail} total)`);
 if (failures.length) {
   console.log('\nFAILURES:');

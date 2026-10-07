@@ -162,7 +162,7 @@ console.log('=== 10. Shop catalog integrity ===');
   check('findShopItem resolves category correctly', h.findShopItem('slot3').category === 'Upgrades');
 }
 
-console.log('=== 11. Jobs: loot tables + durability ===');
+console.log('=== 11. Jobs: loot tables + tools ===');
 {
   for (const job of ['fish', 'mine', 'hunt']) {
     const total = h.JOB_LOOT[job].reduce((s, e) => s + e.weight, 0);
@@ -171,16 +171,15 @@ console.log('=== 11. Jobs: loot tables + durability ===');
 
   h.db.prepare('DELETE FROM owned_tools WHERE user_id = ?').run(U1);
   h.setToolTier(U1, 'fish', 1);
-  check('buying tier 1 sets durability to 100', h.getTool(U1, 'fish').durability === 100);
-
-  for (let i = 0; i < 5; i++) h.damageTool(U1, 'fish');
-  check('5 uses = 100 - 5*5 = 75 durability', h.getTool(U1, 'fish').durability === 75);
-
-  for (let i = 0; i < 20; i++) h.damageTool(U1, 'fish');
-  check('durability floors at 0, never negative', h.getTool(U1, 'fish').durability === 0);
-
-  const repairInfo = h.repairTool(U1, 'fish');
-  check('repair cost = missing(100) * rate(2) = 200', repairInfo.cost === 200, `got ${repairInfo.cost}`);
+  check('buying tier 1 gives the tool', h.getToolTier(U1, 'fish') === 1);
+  h.setToolTier(U1, 'fish', 3);
+  check('upgrading to tier 3 sticks', h.getToolTier(U1, 'fish') === 3);
+  check('no durability or repair left in the bot', h.damageTool === undefined && h.repairTool === undefined);
+  const prices = {};
+  for (const [job, pre] of [['fish', 'rod'], ['mine', 'pick'], ['hunt', 'bow']])
+    for (const tier of [1, 2, 3]) prices[`${job}_${tier}`] = h.findShopItem(`${pre}_${tier}`)?.price;
+  check('tool prices: 750 / 3000 / 9000 for every job',
+    ['fish', 'mine', 'hunt'].every(j => prices[`${j}_1`] === 750 && prices[`${j}_2`] === 3000 && prices[`${j}_3`] === 9000), JSON.stringify(prices));
 }
 
 console.log('=== 12. Weekly quests ===');

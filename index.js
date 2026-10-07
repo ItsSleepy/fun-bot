@@ -474,15 +474,15 @@ const SHOP_CATEGORIES = ['Tools', 'Boosts', 'Pet Chests', 'Pet Items', 'Upgrades
 
 const SHOP_ITEMS = {
   Tools: [
-    { key: 'rod_1', name: 'Fishing Rod I', price: 500, job: 'fish', tier: 1 },
-    { key: 'rod_2', name: 'Fishing Rod II', price: 2000, job: 'fish', tier: 2 },
-    { key: 'rod_3', name: 'Fishing Rod III', price: 6000, job: 'fish', tier: 3 },
-    { key: 'pick_1', name: 'Pickaxe I', price: 500, job: 'mine', tier: 1 },
-    { key: 'pick_2', name: 'Pickaxe II', price: 2000, job: 'mine', tier: 2 },
-    { key: 'pick_3', name: 'Pickaxe III', price: 6000, job: 'mine', tier: 3 },
-    { key: 'bow_1', name: 'Bow I', price: 500, job: 'hunt', tier: 1 },
-    { key: 'bow_2', name: 'Bow II', price: 2000, job: 'hunt', tier: 2 },
-    { key: 'bow_3', name: 'Bow III', price: 6000, job: 'hunt', tier: 3 },
+    { key: 'rod_1', name: 'Fishing Rod I', price: 750, job: 'fish', tier: 1 },
+    { key: 'rod_2', name: 'Fishing Rod II', price: 3000, job: 'fish', tier: 2 },
+    { key: 'rod_3', name: 'Fishing Rod III', price: 9000, job: 'fish', tier: 3 },
+    { key: 'pick_1', name: 'Pickaxe I', price: 750, job: 'mine', tier: 1 },
+    { key: 'pick_2', name: 'Pickaxe II', price: 3000, job: 'mine', tier: 2 },
+    { key: 'pick_3', name: 'Pickaxe III', price: 9000, job: 'mine', tier: 3 },
+    { key: 'bow_1', name: 'Bow I', price: 750, job: 'hunt', tier: 1 },
+    { key: 'bow_2', name: 'Bow II', price: 3000, job: 'hunt', tier: 2 },
+    { key: 'bow_3', name: 'Bow III', price: 9000, job: 'hunt', tier: 3 },
   ],
   Boosts: [
     { key: 'boost_coin', name: 'Coin Boost (15m, +25% daily coins)', price: 300, stat: 'coin', value: 25, durationMs: 900000 },
@@ -565,24 +565,9 @@ function getTool(userId, jobKey) {
   return db.prepare('SELECT * FROM owned_tools WHERE user_id = ? AND job_key = ?').get(userId, jobKey);
 }
 function setToolTier(userId, jobKey, tier) {
-  // buying/upgrading a tool always restores full durability — it's a new (or newly refurbished) item
   db.prepare(
     'INSERT INTO owned_tools (user_id, job_key, tier, durability) VALUES (?, ?, ?, 100) ON CONFLICT(user_id, job_key) DO UPDATE SET tier = excluded.tier, durability = 100'
   ).run(userId, jobKey, tier);
-}
-const MAX_DURABILITY = 100;
-const DURABILITY_LOSS_PER_USE = 5;
-const REPAIR_COST_PER_POINT = { 1: 2, 2: 5, 3: 10 }; // scales with tool tier value
-function damageTool(userId, jobKey) {
-  db.prepare('UPDATE owned_tools SET durability = MAX(0, durability - ?) WHERE user_id = ? AND job_key = ?')
-    .run(DURABILITY_LOSS_PER_USE, userId, jobKey);
-}
-function repairTool(userId, jobKey) {
-  const tool = getTool(userId, jobKey);
-  if (!tool) return null;
-  const missing = MAX_DURABILITY - tool.durability;
-  const cost = missing * REPAIR_COST_PER_POINT[tool.tier];
-  return { tool, missing, cost };
 }
 function addBoost(userId, boostKey, stat, value, durationMs) {
   db.prepare('INSERT INTO active_boosts (user_id, boost_key, stat, value, expires_at) VALUES (?, ?, ?, ?, ?)')
@@ -641,11 +626,6 @@ async function runJob(interaction, jobKey) {
     await interaction.reply({ content: `You need a ${TOOL_LABELS[jobKey]} first — check \`/shop\` under Tools.`, ephemeral: true });
     return;
   }
-  const tool = getTool(interaction.user.id, jobKey);
-  if (tool.durability <= 0) {
-    await interaction.reply({ content: `Your ${TOOL_LABELS[jobKey]} is broken (0 durability) — use \`/repair job:${jobKey}\` first.`, ephemeral: true });
-    return;
-  }
   const cooldownMs = JOB_COOLDOWNS[tier];
   const remaining = getJobCooldownRemaining(interaction.user.id, jobKey, cooldownMs);
   if (remaining > 0) {
@@ -655,7 +635,6 @@ async function runJob(interaction, jobKey) {
   }
 
   setJobCooldown(interaction.user.id, jobKey);
-  damageTool(interaction.user.id, jobKey);
   const loot = rollJobLoot(jobKey);
   const buff = getActiveBuff(interaction.user.id);
   const isDoubleLoot = Date.now() < doubleLootUntil;
@@ -673,14 +652,11 @@ async function runJob(interaction, jobKey) {
   trackQuest(interaction.user.id, `${jobKey}_any`);
   await incrementMilestone('total_jobs', interaction.user.id, 1);
 
-  const newDurability = getTool(interaction.user.id, jobKey).durability;
-  const durabilityWarning = newDurability <= 20 ? ` ⚠️ Tool durability low (${newDurability}/${MAX_DURABILITY})` : '';
-
   const embed = new EmbedBuilder()
     .setTitle(`${loot.emoji} You ${JOB_VERBS[jobKey]} a ${loot.name}!${isDoubleLoot ? ' 🎉 DOUBLE LOOT!' : ''}`)
     .setDescription(`+${fmt(coin)}${candyLine}`)
     .setColor(0x8D6E63)
-    .setFooter({ text: `${TOOL_LABELS[jobKey]} tier ${tier} · durability ${newDurability}/${MAX_DURABILITY}${durabilityWarning}` });
+    .setFooter({ text: `${TOOL_LABELS[jobKey]} tier ${tier}` });
   await interaction.reply({ embeds: [embed] });
 }
 
@@ -1230,9 +1206,6 @@ async function registerCommands() {
       .addUserOption(o => o.setName('user').setDescription('Who to challenge').setRequired(true))
       .addIntegerOption(o => o.setName('your_pet').setDescription('Your pet ID').setRequired(true))
       .addIntegerOption(o => o.setName('wager').setDescription('Optional coin wager (0 for bragging rights only)').setMinValue(0)),
-    new SlashCommandBuilder().setName('repair').setDescription('Repair a worn-down tool')
-      .addStringOption(o => o.setName('job').setDescription('Which tool').setRequired(true)
-        .addChoices({ name: 'Fishing Rod', value: 'fish' }, { name: 'Pickaxe', value: 'mine' }, { name: 'Bow', value: 'hunt' })),
     new SlashCommandBuilder().setName('pet-evolve').setDescription(`Evolve a level ${EVOLVE_LEVEL}+ pet into a stronger form`)
       .addIntegerOption(o => o.setName('id').setDescription('Pet ID (from /pets)').setRequired(true)),
     new SlashCommandBuilder().setName('boss').setDescription('Check the current co-op boss, or spawn one if none is active'),
@@ -2174,28 +2147,6 @@ client.on('interactionCreate', async (interaction) => {
     return;
   }
 
-  if (interaction.commandName === 'repair') {
-    const jobKey = interaction.options.getString('job', true);
-    const info = repairTool(interaction.user.id, jobKey);
-    if (!info) {
-      await interaction.reply({ content: `You don't own a ${TOOL_LABELS[jobKey]} yet.`, ephemeral: true });
-      return;
-    }
-    if (info.missing === 0) {
-      await interaction.reply({ content: `Your ${TOOL_LABELS[jobKey]} is already at full durability.`, ephemeral: true });
-      return;
-    }
-    const user = getUser(interaction.user.id);
-    if (user.balance < info.cost) {
-      await interaction.reply({ content: `Repairing costs ${fmt(info.cost)} — you have ${fmt(user.balance)}.`, ephemeral: true });
-      return;
-    }
-    addBalance(interaction.user.id, -info.cost);
-    db.prepare('UPDATE owned_tools SET durability = ? WHERE user_id = ? AND job_key = ?').run(MAX_DURABILITY, interaction.user.id, jobKey);
-    await interaction.reply(`🔧 Repaired your ${TOOL_LABELS[jobKey]} to full durability for ${fmt(info.cost)}.`);
-    return;
-  }
-
   if (interaction.commandName === 'duel') {
     const target = interaction.options.getUser('user', true);
     const amount = interaction.options.getInteger('amount', true);
@@ -2327,8 +2278,7 @@ client.on('interactionCreate', async (interaction) => {
     const toolLines = ['fish', 'mine', 'hunt'].map(job => {
       const tool = getTool(interaction.user.id, job);
       if (!tool) return `${JOB_LABELS[job]}: *none*`;
-      const durWarn = tool.durability <= 20 ? ' ⚠️' : '';
-      return `${JOB_LABELS[job]}: ${TOOL_LABELS[job]} tier ${tool.tier} (${tool.durability}/${MAX_DURABILITY} durability${durWarn})`;
+      return `${JOB_LABELS[job]}: ${TOOL_LABELS[job]} tier ${tool.tier}`;
     });
 
     const boostLines = boosts.length

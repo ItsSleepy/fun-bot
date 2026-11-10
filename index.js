@@ -809,8 +809,9 @@ const ROB_COOLDOWN_MS = 2 * 60 * 60 * 1000;
 const ROB_PROTECT_MS = 60 * 60 * 1000;
 const ROB_TARGET_MIN = 200;
 const ROB_ROBBER_MIN = 100;
-const ROB_STEAL_MIN_PCT = 10, ROB_STEAL_MAX_PCT = 25, ROB_STEAL_CAP = 2000;
-const ROB_FINE_PCT = 15, ROB_FINE_MIN = 100;
+// Each rob rolls one percentage (10-50%). Success: you take that % of their wallet.
+// Caught: it backfires and that % of YOUR wallet goes to them. No cap either way.
+const ROB_PCT_MIN = 10, ROB_PCT_MAX = 50;
 const ROB_ITEM_MAX = 5;
 
 function getRobItem(userId, key) {
@@ -858,18 +859,18 @@ const resolveRob = db.transaction((robberId, targetId, rand = Math.random) => {
   }
 
   const target = getUser(targetId), robber = getUser(robberId);
+  const pct = Math.min(ROB_PCT_MAX, ROB_PCT_MIN + Math.floor(rand() * (ROB_PCT_MAX - ROB_PCT_MIN + 1)));
   if (success) {
-    const pct = ROB_STEAL_MIN_PCT + rand() * (ROB_STEAL_MAX_PCT - ROB_STEAL_MIN_PCT);
-    const stolen = Math.min(ROB_STEAL_CAP, target.balance, Math.max(1, Math.floor(target.balance * pct / 100)));
+    const stolen = Math.min(target.balance, Math.max(1, Math.floor(target.balance * pct / 100)));
     addBalance(targetId, -stolen);
     addBalance(robberId, stolen);
     db.prepare('UPDATE users SET last_robbed = ? WHERE user_id = ?').run(now, targetId);
-    return { success: true, stolen, fine: 0, chance, usedLockpick, usedMask, blockedByPadlock, guard };
+    return { success: true, pct, stolen, fine: 0, chance, usedLockpick, usedMask, blockedByPadlock, guard };
   }
-  const fine = Math.min(robber.balance, Math.max(ROB_FINE_MIN, Math.floor(robber.balance * ROB_FINE_PCT / 100)));
+  const fine = Math.min(robber.balance, Math.max(1, Math.floor(robber.balance * pct / 100)));
   addBalance(robberId, -fine);
   addBalance(targetId, fine);
-  return { success: false, stolen: 0, fine, chance, usedLockpick, usedMask, blockedByPadlock, guard };
+  return { success: false, pct, stolen: 0, fine, chance, usedLockpick, usedMask, blockedByPadlock, guard };
 });
 
 // ---------- Bank heists ----------
@@ -1598,7 +1599,7 @@ async function registerCommands(onlyGuildId = null) {
     new SlashCommandBuilder().setName('pet-rename').setDescription('Give one of your pets a nickname (leave name empty to clear it)')
       .addIntegerOption(o => o.setName('id').setDescription('Pet ID (from /pets)').setRequired(true))
       .addStringOption(o => o.setName('name').setDescription(`New nickname (up to ${PET_NICK_MAX} characters)`).setMaxLength(PET_NICK_MAX)),
-    new SlashCommandBuilder().setName('rob').setDescription(`Try to steal ${CURRENCY_NAME} from someone's wallet (risky — get caught and you pay them)`)
+    new SlashCommandBuilder().setName('rob').setDescription(`Steal 10-50% of someone's wallet. Get caught and that % of YOUR wallet goes to them`)
       .addUserOption(o => o.setName('user').setDescription('Who to rob').setRequired(true)),
     new SlashCommandBuilder().setName('bank').setDescription(`Keep ${CURRENCY_NAME} in the bank, safe from robbers`)
       .addSubcommand(sc => sc.setName('view').setDescription('See your wallet and bank'))
@@ -2080,18 +2081,18 @@ client.on('interactionCreate', async (interaction) => {
     let title, desc, color;
     if (r.success) {
       title = '💰 Robbery!';
-      desc = `${robber} robbed ${target} and got away with **${fmt(r.stolen)}**!${r.usedLockpick ? '\n🗝️ A lockpick helped.' : ''}`;
+      desc = `${robber} robbed ${target} and got away with **${fmt(r.stolen)}** (**${r.pct}%** of their wallet)!${r.usedLockpick ? '\n🗝️ A lockpick helped.' : ''}`;
       color = 0x4CAF50;
     } else {
       const who = r.usedMask ? 'A masked robber 🎭' : `${robber}`;
       title = r.blockedByPadlock ? '🔒 Blocked by a padlock!' : '🚨 Caught!';
-      desc = `${who} tried to rob ${target} ${r.blockedByPadlock ? 'but their padlock held' : 'and got caught'} — paid them **${fmt(r.fine)}** in fines.`;
+      desc = `${who} tried to rob ${target} ${r.blockedByPadlock ? 'but their padlock held' : 'and got caught'}. The **${r.pct}%** backfired: ${r.usedMask ? 'they' : robber} paid ${target} **${fmt(r.fine)}**.`;
       color = 0xE53935;
     }
     const embed = new EmbedBuilder().setTitle(title).setDescription(desc).setColor(color);
     if (!r.success && r.usedMask) {
       // victim sees an anonymous public message; the robber gets the details privately
-      await interaction.reply({ content: `🎭 You got caught robbing ${target.username}, but your mask hid who you were. You paid ${fmt(r.fine)}.`, ephemeral: true });
+      await interaction.reply({ content: `🎭 You got caught robbing ${target.username}, but your mask hid who you were. The ${r.pct}% backfired: you paid them ${fmt(r.fine)}.`, ephemeral: true });
       try { await interaction.channel.send({ content: `${target}`, embeds: [embed] }); } catch (e) { console.error('rob notice failed', e.message); }
       return;
     }

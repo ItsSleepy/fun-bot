@@ -362,7 +362,7 @@ console.log('=== 21. Roulette bet validation + evaluation ===');
 
   // evaluation correctness — deterministic, no RNG involved
   check('number bet wins only on exact match', h.evaluateRouletteBet('number', '17', 17).won === true && h.evaluateRouletteBet('number', '17', 18).won === false);
-  check('number bet pays 36x', h.evaluateRouletteBet('number', '17', 17).payoutMultiplier === 36);
+  check('number bet pays 35x', h.evaluateRouletteBet('number', '17', 17).payoutMultiplier === 35);
   check('color bet wins on matching color', h.evaluateRouletteBet('color', 'red', 1).won === true); // 1 is red
   check('color bet loses on 0 (green)', h.evaluateRouletteBet('color', 'red', 0).won === false);
   check('color bet pays 2x', h.evaluateRouletteBet('color', 'red', 1).payoutMultiplier === 2);
@@ -556,6 +556,137 @@ console.log('=== 28. Audit fixes: pet slots, battles ===');
   const r = h.resolveBattle(U1, U2, a, b, 40);
   const bal = id => h.getUser(id).balance;
   check('wager always moves winner +40 / loser -40', r.wagerPaid === 40 && bal(r.winnerId) === 140 && bal(r.loserId) === 60, `${bal(r.winnerId)}/${bal(r.loserId)}`);
+}
+
+console.log('\n=== 29. Phase 9: loans, stocks, nicknames ===');
+{
+  const L = 'test_loan_user';
+  h.getUser(L); h.db.prepare('UPDATE users SET balance = 100 WHERE user_id = ?').run(L);
+  const loan = h.takeLoan(L, 500);
+  check('loan pays out principal', h.getUser(L).balance === 600);
+  check('loan owes 5% more', loan.owed === 525, String(loan.owed));
+  check('second loan refused while one is open', h.takeLoan(L, 100) === null && h.getUser(L).balance === 600);
+  let r = h.repayLoan(L, 200);
+  check('partial repay', r.paid === 200 && r.left === 325 && h.getUser(L).balance === 400);
+  r = h.repayLoan(L);
+  check('full repay clears loan', r.paid === 325 && r.left === 0 && h.getLoan(L) === null && h.getUser(L).balance === 75);
+  // overdue collection takes what it can, never goes negative
+  h.takeLoan(L, 1000);                        // balance 1075, owes 1050
+  h.db.prepare('UPDATE users SET balance = 300 WHERE user_id = ?').run(L);
+  h.db.prepare('UPDATE loans SET due_at = 0 WHERE user_id = ?').run(L);
+  h.collectOverdueLoans();
+  check('overdue collects what it can', h.getUser(L).balance === 0 && h.getLoan(L).owed === 750, `${h.getUser(L).balance}/${h.getLoan(L) && h.getLoan(L).owed}`);
+  h.collectOverdueLoans();
+  check('broke borrower stays at 0, debt kept', h.getUser(L).balance === 0 && h.getLoan(L).owed === 750);
+  h.db.prepare('UPDATE users SET balance = 1000 WHERE user_id = ?').run(L);
+  h.collectOverdueLoans();
+  check('later income settles overdue debt', h.getLoan(L) === null && h.getUser(L).balance === 250);
+  const notDue = 'test_loan_user2'; h.getUser(notDue);
+  h.takeLoan(notDue, 100); h.collectOverdueLoans();
+  check('loans not yet due are left alone', h.getLoan(notDue).owed === 105);
+
+  const counts = {};
+  const N = 200000;
+  for (let i = 0; i < N; i++) { const c = h.rollStocks().coins(); counts[c] = (counts[c] || 0) + 1; }
+  const pct = c => (counts[c] || 0) / N * 100;
+  check('stocks: ~50% nothing', approx(pct(0), 50, 1), pct(0).toFixed(2));
+  check('stocks: ~5% 1k', approx(pct(1000), 5, 0.4), pct(1000).toFixed(2));
+  check('stocks: ~4.9% 2k', approx(pct(2000), 4.9, 0.4), pct(2000).toFixed(2));
+  check('stocks: ~0.1% 10k', approx(pct(10000), 0.1, 0.06), pct(10000).toFixed(3));
+
+  check('nickname strips markdown/mentions', h.cleanNickname('**@everyone** <b>') === 'everyone b', h.cleanNickname('**@everyone** <b>'));
+  check('nickname length capped', h.cleanNickname('x'.repeat(50)).length === 24);
+  check('withNick formats', h.withNick({ nickname: 'Bob' }, 'Dragon') === '"Bob" (Dragon)' && h.withNick({}, 'Dragon') === 'Dragon');
+}
+
+console.log('\n=== 30. Bank + robbing ===');
+{
+  const A = 'rob_a', B = 'rob_b', OWN = '546429809459200000';
+  const set = (id, bal, bank = 0) => { h.getUser(id); h.db.prepare('UPDATE users SET balance = ?, bank = ?, last_rob = 0, last_robbed = 0 WHERE user_id = ?').run(bal, bank, id); };
+  set(A, 1000);
+  check('deposit all', h.bankDeposit(A) === 1000 && h.getUser(A).balance === 0 && h.getUser(A).bank === 1000);
+  check('withdraw part', h.bankWithdraw(A, 300) === 300 && h.getUser(A).balance === 300 && h.getUser(A).bank === 700);
+  check('withdraw capped at bank', h.bankWithdraw(A, 99999) === 700 && h.getUser(A).bank === 0);
+
+  set(A, 1000); set(B, 5000, 100000);
+  check('cannot rob self', /yourself/.test(h.robProblem(A, A)));
+  set(B, 150); check('poor target refused', /not worth/.test(h.robProblem(A, B) || ''));
+  set(B, 5000, 100000); set(A, 50); check('broke robber refused', /at least/.test(h.robProblem(A, B) || ''));
+  set(A, 1000);
+  let r = h.resolveRob(A, B, () => 0.0);       // forced success, rand 0 => lowest roll, 10%
+  check('success steals the rolled % (10%) of the wallet only', r.success && r.pct === 10 && r.stolen === 500 && h.getUser(B).balance === 4500 && h.getUser(B).bank === 100000, JSON.stringify(r));
+  check('robber cooldown set', /laying low/.test(h.robProblem(A, B) || ''));
+  set(A, 1000); check('victim protected after robbery', /on guard/.test(h.robProblem(A, B) || ''));
+  set(A, 1000); set(B, 50000);
+  { let k = 0; r = h.resolveRob(A, B, () => (k++ === 0 ? 0.0 : 0.999)); }   // succeed, then top roll
+  check('no cap: top roll steals 50% of a big wallet', r.success && r.pct === 50 && r.stolen === 25000 && h.getUser(B).balance === 25000, JSON.stringify(r));
+  set(A, 2000); set(B, 5000);
+  r = h.resolveRob(A, B, () => 0.99);          // fails; same roll gives 50%
+  check('caught: the rolled % of the robber\'s wallet goes to the victim', !r.success && r.pct === 50 && r.fine === 1000 && h.getUser(A).balance === 1000 && h.getUser(B).balance === 6000, JSON.stringify(r));
+  set(A, 300); set(B, 5000);
+  { let k = 0; r = h.resolveRob(A, B, () => (k++ === 0 ? 0.99 : 0.0)); }    // fail, lowest roll
+  check('caught with a 10% roll: pays exactly 10%, no minimum', !r.success && r.pct === 10 && r.fine === 30 && h.getUser(A).balance === 270, JSON.stringify(r));
+  { const seen = new Set(); for (let i = 0; i < 3000; i++) { set(A, 1000); set(B, 5000); seen.add(h.resolveRob(A, B).pct); }
+    check('rolls cover 10..50 and nothing else', seen.size === 41 && Math.min(...seen) === 10 && Math.max(...seen) === 50, [...seen].sort((a, b) => a - b).join(',')); }
+  set(A, 1000); set(B, 5000); h.addRobItem(B, 'padlock', 1);
+  r = h.resolveRob(A, B, () => 0.0);
+  check('padlock blocks and breaks', !r.success && r.blockedByPadlock && h.getRobItem(B, 'padlock') === 0 && h.getUser(B).balance > 5000);
+  set(A, 1000); set(B, 5000); h.addRobItem(A, 'lockpick', 1); h.addRobItem(A, 'mask', 1);
+  r = h.resolveRob(A, B, () => 0.5);           // 0.5 < 0.40+0.15 → success thanks to lockpick
+  check('lockpick adds 15% and is used', r.success && r.usedLockpick && h.getRobItem(A, 'lockpick') === 0 && h.getRobItem(A, 'mask') === 0);
+  set(A, 1000); set(B, 5000); h.addBoost(B, 'guard_dog', 'guard', 20, 60000);
+  r = h.resolveRob(A, B, () => 0.3);           // 0.3 >= 0.40-0.20 → fails with guard dog
+  check('guard dog lowers odds by 20%', !r.success && Math.abs(r.chance - 0.20) < 1e-9, String(r.chance));
+  // owner luck: robbing succeeds more often, being robbed succeeds less often
+  let ownWins = 0, ownRobbed = 0; const T = 4000;
+  for (let i = 0; i < T; i++) { set(OWN, 1000); set('rob_c', 5000); if (h.resolveRob(OWN, 'rob_c').success) ownWins++; }
+  for (let i = 0; i < T; i++) { set(A, 1000); set(OWN, 5000); if (h.resolveRob(A, OWN).success) ownRobbed++; }
+  check('owner robs always succeed', ownWins === T, String(ownWins));
+  check('owner is robbed less (~34%)', approx(ownRobbed / T, 0.40 * (1 - 0.35 * 0.6), 0.03), (ownRobbed / T).toFixed(3));
+}
+
+console.log('\n=== 31. House games can\'t be beaten with buffs ===');
+{
+  const maxBuff = 500; // far more than anyone can stack
+  check('bonus capped at +5%', h.houseWinBonus(maxBuff) === 5 && h.houseWinBonus(25) === 2.5);
+  const ev = (p, mult) => (p * h.housePayout(10000, mult, maxBuff)) / 10000;
+  check('coinflip EV < 1 even fully buffed', ev(0.5, 1.95) < 1, ev(0.5, 1.95).toFixed(4));
+  check('roulette colour EV < 1 even fully buffed', ev(18 / 37, 2) < 1, ev(18 / 37, 2).toFixed(4));
+  check('roulette number EV < 1 even fully buffed', ev(1 / 37, 35) < 1, ev(1 / 37, 35).toFixed(4));
+  check('unbuffed payout unchanged for 2x', h.housePayout(1000, 2, 0) === 2000);
+}
+
+console.log('\n=== 32. Bank heists ===');
+{
+  const L = 'hz_lead', M = 'hz_mem', V = 'hz_vic', OWN = '546429809459200000';
+  const reset = (id, bal, bank = 0) => { h.getUser(id); h.db.prepare('UPDATE users SET balance = ?, bank = ?, last_heist = 0, last_heisted = 0 WHERE user_id = ?').run(bal, bank, id); h.db.prepare('DELETE FROM rob_items WHERE user_id = ?').run(id); };
+  const gear = (id, kit = 1, drill = 0, laptop = 0) => { if (kit) h.addRobItem(id, 'heist_kit', kit); if (drill) h.addRobItem(id, 'drill', drill); if (laptop) h.addRobItem(id, 'laptop', laptop); };
+  reset(L, 1000); reset(M, 1000); reset(V, 0, 100000);
+  check('needs a kit to join', /Heist Kit/.test(h.heistMemberProblem(L, V) || ''));
+  gear(L, 1, 1, 0); gear(M, 1, 0, 0);
+  check('solo crew refused', /at least 2/.test(h.heistStartProblem([L], V) || ''));
+  check('needs a laptop', /Laptop/.test(h.heistStartProblem([L, M], V) || ''));
+  h.addRobItem(M, 'laptop', 1);
+  check('ready crew passes', h.heistStartProblem([L, M], V) === null);
+  reset(V, 0, 1000); check('poor bank refused', /not worth/.test(h.heistTargetProblem(V) || ''));
+  reset(V, 0, 100000);
+  let r = h.resolveHeist([L, M], V, () => 0.0);
+  check('success takes 10% of bank, split', r.success && r.take === 10000 && h.getUser(L).balance === 6000 && h.getUser(M).balance === 6000 && h.getUser(V).bank === 90000, JSON.stringify(r));
+  check('gear used up', h.getRobItem(L, 'heist_kit') === 0 && h.getRobItem(L, 'drill') === 0 && h.getRobItem(M, 'laptop') === 0);
+  check('crew on cooldown', /laying low/.test(h.heistMemberProblem(L, V) || ''));
+  check('victim protected 48h', /security is tight/.test(h.heistTargetProblem(V) || ''));
+  reset(L, 1000); reset(M, 500); reset(V, 0, 1000000); gear(L, 1, 1, 1); gear(M);
+  r = h.resolveHeist([L, M], V, () => 0.0);
+  check('take capped at 20k', r.take === 20000);
+  reset(L, 1000); reset(M, 500); reset(V, 0, 100000); gear(L, 1, 1, 1); gear(M);
+  r = h.resolveHeist([L, M], V, () => 0.99);
+  check('failure fines 20% each to the victim', !r.success && r.fines[L] === 200 && r.fines[M] === 100 && h.getUser(V).balance === 300, JSON.stringify(r));
+  reset(L, 1000); reset(M, 500); reset(V, 0, 100000); gear(L, 1, 1, 1); gear(M); h.addBoost(V, 'vault_alarm', 'vault', 15, 60000);
+  r = h.resolveHeist([L, M], V, () => 0.25);
+  check('vault alarm lowers odds by 15%', !r.success && Math.abs(r.chance - 0.20) < 1e-9, String(r.chance));
+  reset(OWN, 1000); reset(M, 500); reset('hz_vic2', 0, 100000); gear(OWN, 1, 1, 1); gear(M);
+  r = h.resolveHeist([OWN, M], 'hz_vic2', () => 0.99);
+  check('owner crews always succeed', r.success);
 }
 
 console.log(`RESULTS: ${pass} passed, ${fail} failed (${pass + fail} total)`);

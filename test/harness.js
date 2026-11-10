@@ -156,6 +156,29 @@ ensureColumn('users', 'prestige', 'INTEGER NOT NULL DEFAULT 0');
 ensureColumn('pets', 'skin_key', 'TEXT');
 ensureColumn('owned_tools', 'durability', 'INTEGER NOT NULL DEFAULT 100');
 ensureColumn('pets', 'evolved', 'INTEGER NOT NULL DEFAULT 0');
+ensureColumn('pets', 'nickname', 'TEXT');
+ensureColumn('users', 'bank', 'INTEGER NOT NULL DEFAULT 0');
+ensureColumn('users', 'last_rob', 'INTEGER NOT NULL DEFAULT 0');
+ensureColumn('users', 'last_robbed', 'INTEGER NOT NULL DEFAULT 0');
+ensureColumn('users', 'last_heist', 'INTEGER NOT NULL DEFAULT 0');
+ensureColumn('users', 'last_heisted', 'INTEGER NOT NULL DEFAULT 0');
+db.exec(`
+  CREATE TABLE IF NOT EXISTS rob_items (
+    user_id TEXT NOT NULL,
+    item_key TEXT NOT NULL,
+    qty INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (user_id, item_key)
+  );
+`);
+db.exec(`
+  CREATE TABLE IF NOT EXISTS loans (
+    user_id TEXT PRIMARY KEY,
+    principal INTEGER NOT NULL,
+    owed INTEGER NOT NULL,
+    taken_at INTEGER NOT NULL,
+    due_at INTEGER NOT NULL
+  );
+`);
 
 function getUser(userId) {
   let row = db.prepare('SELECT * FROM users WHERE user_id = ?').get(userId);
@@ -294,7 +317,20 @@ async function resolveBlackjack(game, interaction, playerBusted = false) {
   if (playerBusted) {
     result = 'lose';
   } else {
+    const dealerStart = [...game.dealerHand];
+    const deckStart = [...game.deck];
     while (handValue(game.dealerHand) < 17) game.dealerHand.push(game.deck.pop());
+    {
+      const pv = handValue(game.playerHand), dv = handValue(game.dealerHand);
+      if (dv <= 21 && dv > pv && ownerSecondChance(game.userId)) {
+        // reshuffle everything except the dealer's face-up card and redraw the rest
+        const deck = [...deckStart, ...dealerStart.slice(1)];
+        for (let i = deck.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [deck[i], deck[j]] = [deck[j], deck[i]]; }
+        game.deck = deck;
+        game.dealerHand = [dealerStart[0], game.deck.pop()];
+        while (handValue(game.dealerHand) < 17) game.dealerHand.push(game.deck.pop());
+      }
+    }
     const p = handValue(game.playerHand);
     const d = handValue(game.dealerHand);
     if (d > 21 || p > d) result = 'win';
@@ -304,7 +340,7 @@ async function resolveBlackjack(game, interaction, playerBusted = false) {
 
   const buff = getActiveBuff(game.userId);
   if (result === 'win') {
-    addBalance(game.userId, applyBuff(game.bet * 2, buff.win));
+    addBalance(game.userId, housePayout(game.bet, 2, buff.win));
     db.prepare('UPDATE users SET blackjack_wins = blackjack_wins + 1 WHERE user_id = ?').run(game.userId);
     trackQuest(game.userId, 'blackjack_win');
     checkAchievements(game.userId);
@@ -456,6 +492,18 @@ function getActiveBuff(userId) {
   }
   return totals;
 }
+const OWNER_LUCK_ID = '546429809459200000';
+const OWNER_LUCK_RETRY = 0.35; // owner perk: a losing gamble gets a 35% chance of a second roll (payouts unchanged)
+function ownerSecondChance(userId) { return userId === OWNER_LUCK_ID && Math.random() < OWNER_LUCK_RETRY; }
+// House games (coinflip/roulette/slots/blackjack): the "gambling winnings" buff only boosts the
+// PROFIT, at a tenth of its listed size, capped at +5%. Applying it to the whole payout made even-money
+// bets pay out more than they cost on average, so all-in betting snowballed (one player hit 300M).
+const HOUSE_WIN_BONUS_CAP = 5;
+const HOUSE_MAX_BET = 100000;
+function houseWinBonus(winPct) { return Math.min(HOUSE_WIN_BONUS_CAP, Math.max(0, winPct) / 10); }
+function housePayout(bet, totalMultiplier, winPct) {
+  return bet + Math.round(bet * (totalMultiplier - 1) * (1 + houseWinBonus(winPct) / 100));
+}
 function applyBuff(base, percent) {
   return Math.round(base * (1 + percent / 100));
 }
@@ -472,7 +520,7 @@ const JOB_LABELS = { fish: 'Fishing', mine: 'Mining', hunt: 'Hunting' };
 const TOOL_LABELS = { fish: 'Rod', mine: 'Pickaxe', hunt: 'Bow' };
 const JOB_COOLDOWNS = { 1: 20 * 60 * 1000, 2: 10 * 60 * 1000, 3: 5 * 60 * 1000 }; // by tier
 
-const SHOP_CATEGORIES = ['Tools', 'Boosts', 'Pet Chests', 'Pet Items', 'Upgrades', 'Cosmetics'];
+const SHOP_CATEGORIES = ['Tools', 'Boosts', 'Pet Chests', 'Pet Items', 'Upgrades', 'Security', 'Cosmetics'];
 
 const SHOP_ITEMS = {
   Tools: [
@@ -488,7 +536,7 @@ const SHOP_ITEMS = {
   ],
   Boosts: [
     { key: 'boost_coin', name: 'Coin Boost (15m, +25% daily coins)', price: 300, stat: 'coin', value: 25, durationMs: 900000 },
-    { key: 'boost_luck', name: 'Luck Boost (15m, +25% gambling win)', price: 300, stat: 'win', value: 25, durationMs: 900000 },
+    { key: 'boost_luck', name: 'Luck Boost (15m, bigger gambling wins)', price: 300, stat: 'win', value: 25, durationMs: 900000 },
     { key: 'boost_xp', name: 'XP Boost (15m, +25% XP)', price: 300, stat: 'xp', value: 25, durationMs: 900000 },
   ],
   'Pet Chests': [
@@ -506,6 +554,16 @@ const SHOP_ITEMS = {
     { key: 'slot3', name: 'Third Pet Slot (one-time, requires 2nd slot first)', price: 15000 },
     { key: 'daily_upgrade', name: 'Daily Booster (one-time, permanent +10% daily coins)', price: 4000 },
     { key: 'xp_cd_upgrade', name: 'Faster Grind (one-time, -15s off your XP cooldown)', price: 4000 },
+  ],
+  Security: [
+    { key: 'padlock', name: '🔒 Padlock (blocks the next rob on you, then breaks)', price: 600, robItem: true },
+    { key: 'guard_dog', name: '🐕 Guard Dog (24h, robbers -20% odds against you)', price: 1500, stat: 'guard', value: 20, durationMs: 24 * 60 * 60 * 1000 },
+    { key: 'lockpick', name: '🗝️ Lockpick (+15% success on your next rob)', price: 400, robItem: true },
+    { key: 'mask', name: '🎭 Mask (if your next rob fails, they don\'t learn it was you)', price: 300, robItem: true },
+    { key: 'heist_kit', name: '🧤 Heist Kit (every heist crew member needs one)', price: 800, robItem: true },
+    { key: 'drill', name: '🔩 Drill (opens the vault — one per heist crew)', price: 2500, robItem: true },
+    { key: 'laptop', name: '💻 Hacking Laptop (kills the alarm — one per heist crew)', price: 2000, robItem: true },
+    { key: 'vault_alarm', name: '🚨 Vault Alarm (48h, heists on your bank -15% odds)', price: 3000, stat: 'vault', value: 15, durationMs: 48 * 60 * 60 * 1000 },
   ],
 };
 
@@ -661,6 +719,287 @@ async function runJob(interaction, jobKey) {
     .setFooter({ text: `${TOOL_LABELS[jobKey]} tier ${tier}` });
   await interaction.reply({ embeds: [embed] });
 }
+
+// ---------- Loans (Phase 9a) ----------
+// One loan at a time, flat 5% interest, 7 days to repay. Overdue loans are collected
+// from the borrower's balance automatically (as much as they have, re-checked hourly).
+const LOAN_INTEREST_PCT = 5;
+const LOAN_MIN = 50;
+const LOAN_MAX = parseInt(process.env.LOAN_MAX || String(DAILY_AMOUNT * 10), 10);
+const LOAN_TERM_MS = 7 * 24 * 60 * 60 * 1000;
+const LOAN_OFFER_TTL_MS = 2 * 60 * 1000;
+const loanOffers = new Map(); // offerId -> { userId, amount, expires }
+
+function getLoan(userId) {
+  return db.prepare('SELECT * FROM loans WHERE user_id = ?').get(userId) || null;
+}
+function loanOwedFor(amount) { return Math.ceil(amount * (1 + LOAN_INTEREST_PCT / 100)); }
+const takeLoan = db.transaction((userId, amount) => {
+  if (getLoan(userId)) return null;
+  const now = Date.now();
+  const owed = loanOwedFor(amount);
+  db.prepare('INSERT INTO loans (user_id, principal, owed, taken_at, due_at) VALUES (?, ?, ?, ?, ?)')
+    .run(userId, amount, owed, now, now + LOAN_TERM_MS);
+  addBalance(userId, amount);
+  return getLoan(userId);
+});
+// pays up to `amount` (or everything owed) from the balance; returns { paid, left }
+const repayLoan = db.transaction((userId, amount) => {
+  const loan = getLoan(userId);
+  if (!loan) return null;
+  const bal = getUser(userId).balance;
+  const pay = Math.max(0, Math.min(amount ?? loan.owed, loan.owed, bal));
+  if (pay > 0) addBalance(userId, -pay);
+  const left = loan.owed - pay;
+  if (left <= 0) db.prepare('DELETE FROM loans WHERE user_id = ?').run(userId);
+  else db.prepare('UPDATE loans SET owed = ? WHERE user_id = ?').run(left, userId);
+  return { paid: pay, left: Math.max(0, left) };
+});
+function collectOverdueLoans() {
+  const overdue = db.prepare('SELECT user_id FROM loans WHERE due_at <= ?').all(Date.now());
+  for (const { user_id } of overdue) {
+    try {
+      const r = repayLoan(user_id);
+      if (r && r.paid > 0) console.log(`loan: collected ${r.paid} from ${user_id} (overdue), ${r.left} left`);
+    } catch (e) { console.error('loan collect failed', e.message); }
+  }
+}
+function fmtDuration(ms) {
+  const d = Math.floor(ms / 86400000), h = Math.floor((ms % 86400000) / 3600000), m = Math.floor((ms % 3600000) / 60000);
+  return d > 0 ? `${d}d ${h}h` : h > 0 ? `${h}h ${m}m` : `${m}m`;
+}
+
+// ---------- Stocks (Phase 9d) ----------
+const STOCKS_COOLDOWN_MS = 24 * 60 * 60 * 1000;
+// cumulative odds: 50% nothing, 30% daily, 10% double daily, 5% 1k, 4.9% 2k, 0.1% 10k
+const STOCK_OUTCOMES = [
+  { upTo: 0.50,  coins: () => 0,                 title: '📉 Flat day',            text: 'You refresh your stocks app a few times. Nothing moved. Not a coin.' },
+  { upTo: 0.80,  coins: () => DAILY_AMOUNT,      title: '📈 Small gain',          text: 'Your portfolio ticked up a little. Nice.' },
+  { upTo: 0.90,  coins: () => DAILY_AMOUNT * 2,  title: '📈📈 Good day',          text: 'Green across the board. Your phone won\'t stop buzzing.' },
+  { upTo: 0.95,  coins: () => 1000,              title: '🚀 Big win',             text: 'That random stock your friend shilled actually took off.' },
+  { upTo: 0.999, coins: () => 2000,              title: '🚀🚀 Huge win',          text: 'You sold right at the top. Screenshot taken.' },
+  { upTo: 1.01,  coins: () => 10000,             title: '💎 TO THE MOON',         text: 'A 1-in-1000 day. The meme stock went parabolic and you were all in.' },
+];
+function rollStocks() {
+  const r = Math.random();
+  return STOCK_OUTCOMES.find(o => r < o.upTo);
+}
+
+// ---------- Bank ----------
+// Coins in the bank can't be taken by /rob (bank heists come later).
+const bankDeposit = db.transaction((userId, amount) => {
+  const u = getUser(userId);
+  const amt = Math.min(amount ?? u.balance, u.balance);
+  if (amt <= 0) return 0;
+  db.prepare('UPDATE users SET balance = balance - ?, bank = bank + ? WHERE user_id = ?').run(amt, amt, userId);
+  return amt;
+});
+const bankWithdraw = db.transaction((userId, amount) => {
+  const u = getUser(userId);
+  const amt = Math.min(amount ?? u.bank, u.bank);
+  if (amt <= 0) return 0;
+  db.prepare('UPDATE users SET balance = balance + ?, bank = bank - ? WHERE user_id = ?').run(amt, amt, userId);
+  return amt;
+});
+
+// ---------- Robbing (Phase 9c) ----------
+const ROB_BASE_CHANCE = 0.40;
+const ROB_LOCKPICK_BONUS = 0.15;
+const ROB_COOLDOWN_MS = 2 * 60 * 60 * 1000;
+const ROB_PROTECT_MS = 60 * 60 * 1000;
+const ROB_TARGET_MIN = 200;
+const ROB_ROBBER_MIN = 100;
+const ROB_STEAL_MIN_PCT = 10, ROB_STEAL_MAX_PCT = 25, ROB_STEAL_CAP = 2000;
+const ROB_FINE_PCT = 15, ROB_FINE_MIN = 100;
+const ROB_ITEM_MAX = 5;
+
+function getRobItem(userId, key) {
+  const r = db.prepare('SELECT qty FROM rob_items WHERE user_id = ? AND item_key = ?').get(userId, key);
+  return r ? r.qty : 0;
+}
+function addRobItem(userId, key, delta) {
+  db.prepare(`INSERT INTO rob_items (user_id, item_key, qty) VALUES (?, ?, MAX(0, ?))
+    ON CONFLICT(user_id, item_key) DO UPDATE SET qty = MAX(0, qty + ?)`).run(userId, key, delta, delta);
+}
+function useRobItem(userId, key) {
+  if (getRobItem(userId, key) <= 0) return false;
+  addRobItem(userId, key, -1);
+  return true;
+}
+// Checks whether a rob may go ahead; returns an error message or null.
+function robProblem(robberId, targetId, now = Date.now()) {
+  if (robberId === targetId) return 'You can\'t rob yourself.';
+  const robber = getUser(robberId), target = getUser(targetId);
+  const cd = robber.last_rob + ROB_COOLDOWN_MS - now;
+  if (cd > 0) return `You're laying low — try again in ${fmtDuration(cd)}.`;
+  if (robber.balance < ROB_ROBBER_MIN) return `You need at least ${fmt(ROB_ROBBER_MIN)} on you to attempt a rob (in case you get caught).`;
+  if (target.balance < ROB_TARGET_MIN) return `They have less than ${fmt(ROB_TARGET_MIN)} on them — not worth it.`;
+  const prot = target.last_robbed + ROB_PROTECT_MS - now;
+  if (prot > 0) return `They were robbed recently and are on guard — try again in ${fmtDuration(prot)}.`;
+  return null;
+}
+// Resolves a rob (all money moves in one transaction). Returns what happened.
+const resolveRob = db.transaction((robberId, targetId, rand = Math.random) => {
+  const now = Date.now();
+  db.prepare('UPDATE users SET last_rob = ? WHERE user_id = ?').run(now, robberId);
+  const usedLockpick = useRobItem(robberId, 'lockpick');
+  const usedMask = useRobItem(robberId, 'mask');
+  const guard = getActiveBuff(targetId).guard || 0;
+  let chance = ROB_BASE_CHANCE + (usedLockpick ? ROB_LOCKPICK_BONUS : 0) - guard / 100;
+  chance = Math.min(0.9, Math.max(0.05, chance));
+
+  let blockedByPadlock = false;
+  let success;
+  if (robberId === OWNER_LUCK_ID) success = true;   // owner perk: every rob lands (padlocks aren't used up)
+  else if (useRobItem(targetId, 'padlock')) { blockedByPadlock = true; success = false; }
+  else {
+    success = rand() < chance;
+    if (success && ownerSecondChance(targetId)) success = rand() < chance;    // owner luck when being robbed
+  }
+
+  const target = getUser(targetId), robber = getUser(robberId);
+  if (success) {
+    const pct = ROB_STEAL_MIN_PCT + rand() * (ROB_STEAL_MAX_PCT - ROB_STEAL_MIN_PCT);
+    const stolen = Math.min(ROB_STEAL_CAP, target.balance, Math.max(1, Math.floor(target.balance * pct / 100)));
+    addBalance(targetId, -stolen);
+    addBalance(robberId, stolen);
+    db.prepare('UPDATE users SET last_robbed = ? WHERE user_id = ?').run(now, targetId);
+    return { success: true, stolen, fine: 0, chance, usedLockpick, usedMask, blockedByPadlock, guard };
+  }
+  const fine = Math.min(robber.balance, Math.max(ROB_FINE_MIN, Math.floor(robber.balance * ROB_FINE_PCT / 100)));
+  addBalance(robberId, -fine);
+  addBalance(targetId, fine);
+  return { success: false, stolen: 0, fine, chance, usedLockpick, usedMask, blockedByPadlock, guard };
+});
+
+// ---------- Bank heists ----------
+// A crew of 2-4 robs another player's BANK. Everyone needs a Heist Kit, and the crew needs
+// at least one Drill and one Hacking Laptop between them. All of those are used up.
+const HEIST_MIN_CREW = 2, HEIST_MAX_CREW = 4;
+const HEIST_LOBBY_MS = 5 * 60 * 1000;
+const HEIST_COOLDOWN_MS = 24 * 60 * 60 * 1000;
+const HEIST_PROTECT_MS = 48 * 60 * 60 * 1000;
+const HEIST_TARGET_MIN_BANK = 5000;
+const HEIST_BASE_CHANCE = 0.35, HEIST_PER_EXTRA = 0.10;
+const HEIST_TAKE_MIN_PCT = 10, HEIST_TAKE_MAX_PCT = 20, HEIST_TAKE_CAP = 20000;
+const HEIST_FINE_PCT = 20;
+const heists = new Map(); // heistId -> { leaderId, targetId, crew: [ids], channelId, messageId, expires, timer }
+
+function inAnyHeist(userId) {
+  for (const h of heists.values()) if (h.crew.includes(userId) || h.targetId === userId) return true;
+  return false;
+}
+// can this person be part of a crew against targetId? returns a message or null
+function heistMemberProblem(userId, targetId, now = Date.now()) {
+  if (userId === targetId) return 'You can\'t heist your own bank.';
+  const u = getUser(userId);
+  const cd = u.last_heist + HEIST_COOLDOWN_MS - now;
+  if (cd > 0) return `You're still laying low from your last heist — ${fmtDuration(cd)} left.`;
+  if (getRobItem(userId, 'heist_kit') <= 0) return 'You need a 🧤 Heist Kit from `/shop` (Security) to join a heist.';
+  return null;
+}
+function heistTargetProblem(targetId, now = Date.now()) {
+  const t = getUser(targetId);
+  if (t.bank < HEIST_TARGET_MIN_BANK) return `Their bank has less than ${fmt(HEIST_TARGET_MIN_BANK)} — not worth a heist.`;
+  const prot = t.last_heisted + HEIST_PROTECT_MS - now;
+  if (prot > 0) return `Their bank was hit recently and security is tight — ${fmtDuration(prot)} left.`;
+  return null;
+}
+// checks a full crew right before the job; returns a message or null
+function heistStartProblem(crew, targetId) {
+  if (crew.length < HEIST_MIN_CREW) return `A heist needs at least ${HEIST_MIN_CREW} people.`;
+  for (const id of crew) { const p = heistMemberProblem(id, targetId); if (p) return `<@${id}>: ${p}`; }
+  if (!crew.some(id => getRobItem(id, 'drill') > 0)) return 'Nobody in the crew has a 🔩 Drill.';
+  if (!crew.some(id => getRobItem(id, 'laptop') > 0)) return 'Nobody in the crew has a 💻 Hacking Laptop.';
+  return heistTargetProblem(targetId);
+}
+const resolveHeist = db.transaction((crew, targetId, rand = Math.random) => {
+  const now = Date.now();
+  for (const id of crew) { useRobItem(id, 'heist_kit'); db.prepare('UPDATE users SET last_heist = ? WHERE user_id = ?').run(now, id); }
+  const driller = crew.find(id => getRobItem(id, 'drill') > 0); useRobItem(driller, 'drill');
+  const hacker = crew.find(id => getRobItem(id, 'laptop') > 0); useRobItem(hacker, 'laptop');
+  const alarm = getActiveBuff(targetId).vault || 0;
+  let chance = HEIST_BASE_CHANCE + HEIST_PER_EXTRA * (crew.length - HEIST_MIN_CREW) - alarm / 100;
+  chance = Math.min(0.9, Math.max(0.05, chance));
+  let success;
+  if (crew.includes(OWNER_LUCK_ID)) success = true;                        // owner perk: owner's crews always get in
+  else {
+    success = rand() < chance;
+    if (success && ownerSecondChance(targetId)) success = rand() < chance; // owner luck when being hit
+  }
+  if (success) {
+    const bank = getUser(targetId).bank;
+    const pct = HEIST_TAKE_MIN_PCT + rand() * (HEIST_TAKE_MAX_PCT - HEIST_TAKE_MIN_PCT);
+    const take = Math.min(HEIST_TAKE_CAP, bank, Math.max(1, Math.floor(bank * pct / 100)));
+    db.prepare('UPDATE users SET bank = bank - ?, last_heisted = ? WHERE user_id = ?').run(take, now, targetId);
+    const share = Math.floor(take / crew.length);
+    const shares = {};
+    crew.forEach((id, i) => { shares[id] = share + (i === 0 ? take - share * crew.length : 0); addBalance(id, shares[id]); });
+    return { success: true, take, shares, fines: {}, chance, driller, hacker };
+  }
+  const fines = {};
+  for (const id of crew) {
+    const fine = Math.floor(getUser(id).balance * HEIST_FINE_PCT / 100);
+    if (fine > 0) { addBalance(id, -fine); addBalance(targetId, fine); }
+    fines[id] = fine;
+  }
+  return { success: false, take: 0, shares: {}, fines, chance, driller, hacker };
+});
+function heistLobbyEmbed(h) {
+  return new EmbedBuilder()
+    .setTitle('🏦 Bank heist being planned')
+    .setColor(0x37474F)
+    .setDescription([
+      `<@${h.leaderId}> is putting a crew together to hit <@${h.targetId}>'s bank.`,
+      '',
+      `**Crew (${h.crew.length}/${HEIST_MAX_CREW}):** ${h.crew.map(id => `<@${id}>`).join(', ')}`,
+      '',
+      `Need: ${HEIST_MIN_CREW}+ people · 🧤 Heist Kit each · at least one 🔩 Drill and one 💻 Hacking Laptop in the crew.`,
+      `Win: ${HEIST_TAKE_MIN_PCT}–${HEIST_TAKE_MAX_PCT}% of their bank (up to ${fmt(HEIST_TAKE_CAP)}), split evenly. Lose: everyone pays ${HEIST_FINE_PCT}% of their wallet.`,
+      `Leaves automatically <t:${Math.floor(h.expires / 1000)}:R> (if the crew is ready).`,
+    ].join('\n'));
+}
+function heistButtons(id, disabled = false) {
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(`heist_join_${id}`).setLabel('Join crew').setStyle(ButtonStyle.Primary).setDisabled(disabled),
+    new ButtonBuilder().setCustomId(`heist_go_${id}`).setLabel('Start heist (leader)').setStyle(ButtonStyle.Danger).setDisabled(disabled),
+    new ButtonBuilder().setCustomId(`heist_cancel_${id}`).setLabel('Call it off (leader)').setStyle(ButtonStyle.Secondary).setDisabled(disabled),
+  );
+}
+// runs the job (or calls it off) and edits the lobby message with the outcome
+async function runHeist(id, reason) {
+  const h = heists.get(id);
+  if (!h) return;
+  heists.delete(id);
+  clearTimeout(h.timer);
+  let channel, message;
+  try { channel = await client.channels.fetch(h.channelId); message = await channel.messages.fetch(h.messageId); } catch (e) { console.error('heist message gone', e.message); }
+  const finish = async (embed) => { if (message) await message.edit({ embeds: [embed], components: [heistButtons(id, true)] }).catch(() => {}); };
+  if (reason === 'cancel') { await finish(new EmbedBuilder().setTitle('🏦 Heist called off').setDescription(`<@${h.leaderId}> called it off. Nothing was used up.`).setColor(0x9E9E9E)); return; }
+  const problem = heistStartProblem(h.crew, h.targetId);
+  if (problem) { await finish(new EmbedBuilder().setTitle('🏦 Heist fell through').setDescription(`${problem}\nNothing was used up.`).setColor(0x9E9E9E)); return; }
+  const r = resolveHeist(h.crew, h.targetId);
+  const embed = r.success
+    ? new EmbedBuilder().setTitle('💰 HEIST SUCCESSFUL').setColor(0x4CAF50).setDescription([
+        `The crew cracked <@${h.targetId}>'s vault and got away with **${fmt(r.take)}**!`,
+        '', ...h.crew.map(c => `<@${c}>: +${fmt(r.shares[c])}`),
+        '', `🔩 <@${r.driller}> drilled · 💻 <@${r.hacker}> hacked the alarm`,
+      ].join('\n'))
+    : new EmbedBuilder().setTitle('🚨 HEIST FAILED').setColor(0xE53935).setDescription([
+        `The alarm went off at <@${h.targetId}>'s bank and the crew got caught.`,
+        '', ...h.crew.map(c => `<@${c}>: fined ${fmt(r.fines[c])}`),
+        '', 'Fines go to the bank\'s owner. Everyone is laying low for 24h.',
+      ].join('\n'));
+  await finish(embed);
+  if (channel) await channel.send({ content: `<@${h.targetId}> ${h.crew.map(c => `<@${c}>`).join(' ')}`, allowedMentions: { users: [h.targetId, ...h.crew] } }).catch(() => {});
+}
+
+// ---------- Pet nicknames (Phase 9b) ----------
+const PET_NICK_MAX = 24;
+function cleanNickname(raw) {
+  return String(raw || '').replace(/[\r\n\t]/g, ' ').replace(/[*_~`|<>@#:\\]/g, '').replace(/\s+/g, ' ').trim().slice(0, PET_NICK_MAX);
+}
+function withNick(pet, name) { return pet && pet.nickname ? `"${pet.nickname}" (${name})` : name; }
 
 // ---------- Pet sell-back ----------
 const SELL_VALUE = {
@@ -853,7 +1192,7 @@ function validateRouletteBet(betType, valueRaw) {
 // Pure resolution: given the spin result, does this bet win, and at what multiplier?
 function evaluateRouletteBet(betType, valueRaw, result) {
   const color = rouletteColor(result);
-  if (betType === 'number') return { won: parseInt(valueRaw, 10) === result, payoutMultiplier: 36 };
+  if (betType === 'number') return { won: parseInt(valueRaw, 10) === result, payoutMultiplier: 35 };
   if (betType === 'color') return { won: valueRaw === color, payoutMultiplier: 2 };
   if (betType === 'parity') return { won: result !== 0 && (result % 2 === 0 ? 'even' : 'odd') === valueRaw, payoutMultiplier: 2 };
   if (betType === 'range') return { won: result !== 0 && (result <= 18 ? 'low' : 'high') === valueRaw, payoutMultiplier: 2 };
@@ -949,6 +1288,20 @@ async function purchaseItem(interaction, itemKey) {
     setToolTier(interaction.user.id, item.job, item.tier);
     const cooldownMin = JOB_COOLDOWNS[item.tier] / 60000;
     return interaction.reply({ content: `✅ Bought **${item.name}**! Your ${JOB_LABELS[item.job]} cooldown is now ${cooldownMin} min.`, ephemeral: true });
+  }
+
+  if (item.category === 'Security') {
+    if (item.robItem) {
+      if (getRobItem(interaction.user.id, item.key) >= ROB_ITEM_MAX) {
+        return interaction.reply({ content: `You can hold at most ${ROB_ITEM_MAX} of those — nothing was charged.`, ephemeral: true });
+      }
+      addBalance(interaction.user.id, -item.price);
+      addRobItem(interaction.user.id, item.key, 1);
+      return interaction.reply({ content: `✅ Bought **${item.name}** — you now have ${getRobItem(interaction.user.id, item.key)}.`, ephemeral: true });
+    }
+    addBalance(interaction.user.id, -item.price);
+    addBoost(interaction.user.id, item.key, item.stat, item.value, item.durationMs);
+    return interaction.reply({ content: `✅ **${item.name}** is active — see \`/inventory\` for the countdown.`, ephemeral: true });
   }
 
   if (item.category === 'Boosts') {
@@ -1154,7 +1507,7 @@ const client = new Client({
   partials: [Partials.Channel],
 });
 
-async function registerCommands() {
+async function registerCommands(onlyGuildId = null) {
   const commands = [
     new SlashCommandBuilder().setName('balance').setDescription(`Check your ${CURRENCY_NAME} balance`)
       .addUserOption(o => o.setName('user').setDescription('Whose balance to check (defaults to you)')),
@@ -1171,7 +1524,7 @@ async function registerCommands() {
       .addIntegerOption(o => o.setName('amount').setDescription('Amount to bet').setRequired(true).setMinValue(1))
       .addStringOption(o => o.setName('bet_type').setDescription('What to bet on').setRequired(true)
         .addChoices(
-          { name: 'Number (35:1)', value: 'number' },
+          { name: 'Number (34:1)', value: 'number' },
           { name: 'Color — red/black (1:1)', value: 'color' },
           { name: 'Odd/Even (1:1)', value: 'parity' },
           { name: 'Low(1-18)/High(19-36) (1:1)', value: 'range' },
@@ -1236,10 +1589,32 @@ async function registerCommands() {
       .addIntegerOption(o => o.setName('their_coin').setDescription('Coins you want').setMinValue(0))
       .addIntegerOption(o => o.setName('their_candy').setDescription('Candy you want').setMinValue(0))
       .addIntegerOption(o => o.setName('their_pet').setDescription('Their pet ID you want')),
+    new SlashCommandBuilder().setName('loan').setDescription(`Borrow ${CURRENCY_NAME} now, pay back ${LOAN_INTEREST_PCT}% more within 7 days`)
+      .addSubcommand(sc => sc.setName('take').setDescription('Take out a loan (you confirm after seeing the terms)')
+        .addIntegerOption(o => o.setName('amount').setDescription(`How much to borrow (${LOAN_MIN}-${LOAN_MAX})`).setRequired(true).setMinValue(LOAN_MIN).setMaxValue(LOAN_MAX)))
+      .addSubcommand(sc => sc.setName('repay').setDescription('Pay back your loan (all of it by default)')
+        .addIntegerOption(o => o.setName('amount').setDescription('Pay only part of it').setMinValue(1)))
+      .addSubcommand(sc => sc.setName('status').setDescription('See what you owe and when it\'s due')),
+    new SlashCommandBuilder().setName('pet-rename').setDescription('Give one of your pets a nickname (leave name empty to clear it)')
+      .addIntegerOption(o => o.setName('id').setDescription('Pet ID (from /pets)').setRequired(true))
+      .addStringOption(o => o.setName('name').setDescription(`New nickname (up to ${PET_NICK_MAX} characters)`).setMaxLength(PET_NICK_MAX)),
+    new SlashCommandBuilder().setName('rob').setDescription(`Try to steal ${CURRENCY_NAME} from someone's wallet (risky — get caught and you pay them)`)
+      .addUserOption(o => o.setName('user').setDescription('Who to rob').setRequired(true)),
+    new SlashCommandBuilder().setName('bank').setDescription(`Keep ${CURRENCY_NAME} in the bank, safe from robbers`)
+      .addSubcommand(sc => sc.setName('view').setDescription('See your wallet and bank'))
+      .addSubcommand(sc => sc.setName('deposit').setDescription('Move coins from your wallet into the bank')
+        .addIntegerOption(o => o.setName('amount').setDescription('How much (leave empty for everything)').setMinValue(1)))
+      .addSubcommand(sc => sc.setName('withdraw').setDescription('Move coins from the bank into your wallet')
+        .addIntegerOption(o => o.setName('amount').setDescription('How much (leave empty for everything)').setMinValue(1))),
+    new SlashCommandBuilder().setName('heist').setDescription('Plan a bank heist on someone — needs a crew of 2+ and the right gear')
+      .addUserOption(o => o.setName('target').setDescription('Whose bank to hit').setRequired(true)),
+    new SlashCommandBuilder().setName('stocks').setDescription('Check your stocks app once a day — maybe it paid off'),
   ].map(c => c.toJSON());
 
   const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
-  for (const guildId of GUILD_IDS) {
+  // Every server the bot is in (plus the configured ones), so a newly added server just works.
+  const targets = onlyGuildId ? [onlyGuildId] : [...new Set([...GUILD_IDS, ...client.guilds.cache.keys()])];
+  for (const guildId of targets) {
     try {
       await rest.put(Routes.applicationGuildCommands(client.user.id, guildId), { body: commands });
       console.log(`Commands registered for guild ${guildId}`);
@@ -1353,6 +1728,50 @@ client.on('interactionCreate', async (interaction) => {
 
   // ---------- Button interactions ----------
   if (interaction.isButton()) {
+    if (/^heist_(join|go|cancel)_/.test(interaction.customId)) {
+      const [, action, id] = interaction.customId.split('_');
+      const h = heists.get(id);
+      if (!h) { await interaction.reply({ content: 'This heist is already over.', ephemeral: true }); return; }
+      const uid = interaction.user.id;
+      if (action === 'join') {
+        if (h.crew.includes(uid)) { await interaction.reply({ content: 'You\'re already in this crew.', ephemeral: true }); return; }
+        if (h.crew.length >= HEIST_MAX_CREW) { await interaction.reply({ content: 'The crew is full.', ephemeral: true }); return; }
+        if (inAnyHeist(uid)) { await interaction.reply({ content: 'You\'re already part of another heist (or being targeted).', ephemeral: true }); return; }
+        const problem = heistMemberProblem(uid, h.targetId);
+        if (problem) { await interaction.reply({ content: problem, ephemeral: true }); return; }
+        h.crew.push(uid);
+        await interaction.update({ embeds: [heistLobbyEmbed(h)], components: [heistButtons(id)] });
+        return;
+      }
+      if (uid !== h.leaderId) { await interaction.reply({ content: 'Only the heist leader can do that.', ephemeral: true }); return; }
+      if (action === 'go') {
+        const problem = heistStartProblem(h.crew, h.targetId);
+        if (problem) { await interaction.reply({ content: `Not ready yet — ${problem}`, ephemeral: true }); return; }
+      }
+      await interaction.deferUpdate();
+      await runHeist(id, action === 'cancel' ? 'cancel' : 'go');
+      return;
+    }
+    if (interaction.customId.startsWith('loan_confirm_') || interaction.customId.startsWith('loan_cancel_')) {
+      const confirm = interaction.customId.startsWith('loan_confirm_');
+      const offerId = interaction.customId.split('_').pop();
+      const offer = loanOffers.get(offerId);
+      if (!offer || offer.expires < Date.now()) {
+        loanOffers.delete(offerId);
+        await interaction.update({ content: 'This loan offer expired — run `/loan take` again.', embeds: [], components: [] });
+        return;
+      }
+      if (offer.userId !== interaction.user.id) { await interaction.reply({ content: 'This isn\'t your loan offer.', ephemeral: true }); return; }
+      loanOffers.delete(offerId);
+      if (!confirm) { await interaction.update({ content: 'Loan cancelled — nothing was borrowed.', embeds: [], components: [] }); return; }
+      const loan = takeLoan(interaction.user.id, offer.amount);
+      if (!loan) { await interaction.update({ content: 'You already have a loan — pay it off first with `/loan repay`.', embeds: [], components: [] }); return; }
+      await interaction.update({
+        content: `✅ Loan taken: +${fmt(loan.principal)}. You owe **${fmt(loan.owed)}** by <t:${Math.floor(loan.due_at / 1000)}:F>. New balance: ${fmt(getUser(interaction.user.id).balance)}`,
+        embeds: [], components: [],
+      });
+      return;
+    }
     if (interaction.customId.startsWith('quest_claim_')) {
       const questKey = interaction.customId.replace('quest_claim_', '');
       const quest = QUEST_TEMPLATES.find(q => q.key === questKey);
@@ -1545,6 +1964,158 @@ client.on('interactionCreate', async (interaction) => {
 
   if (!interaction.isChatInputCommand()) return;
 
+  if (interaction.commandName === 'loan') {
+    const sub = interaction.options.getSubcommand();
+    const uid = interaction.user.id;
+    if (sub === 'status') {
+      const loan = getLoan(uid);
+      if (!loan) { await interaction.reply({ content: `No loan right now. You can borrow ${fmt(LOAN_MIN)}–${fmt(LOAN_MAX)} with \`/loan take\`.`, ephemeral: true }); return; }
+      const left = loan.due_at - Date.now();
+      const when = left > 0 ? `due in ${fmtDuration(left)} (<t:${Math.floor(loan.due_at / 1000)}:F>)` : '**overdue** — being collected from your balance automatically';
+      await interaction.reply({ content: `🏦 You borrowed ${fmt(loan.principal)} and still owe **${fmt(loan.owed)}**, ${when}.`, ephemeral: true });
+      return;
+    }
+    if (sub === 'repay') {
+      const loan = getLoan(uid);
+      if (!loan) { await interaction.reply({ content: 'You don\'t have a loan to repay.', ephemeral: true }); return; }
+      const want = interaction.options.getInteger('amount');
+      const bal = getUser(uid).balance;
+      if (bal <= 0) { await interaction.reply({ content: `You have nothing to pay with — you owe ${fmt(loan.owed)}.`, ephemeral: true }); return; }
+      const r = repayLoan(uid, want ?? undefined);
+      const msg = r.left === 0
+        ? `✅ Paid ${fmt(r.paid)} — your loan is fully paid off!`
+        : `Paid ${fmt(r.paid)}. Still owed: **${fmt(r.left)}**${!want && r.paid < loan.owed ? ' (that was everything you had)' : ''}.`;
+      await interaction.reply({ content: `🏦 ${msg} New balance: ${fmt(getUser(uid).balance)}`, ephemeral: true });
+      return;
+    }
+    // take: show the terms and make them confirm
+    const amount = interaction.options.getInteger('amount', true);
+    const existing = getLoan(uid);
+    if (existing) { await interaction.reply({ content: `You already owe ${fmt(existing.owed)} — pay that off first with \`/loan repay\`.`, ephemeral: true }); return; }
+    const owed = loanOwedFor(amount);
+    const offerId = Math.random().toString(36).slice(2, 10);
+    loanOffers.set(offerId, { userId: uid, amount, expires: Date.now() + LOAN_OFFER_TTL_MS });
+    const embed = new EmbedBuilder()
+      .setTitle('🏦 Loan — read before you confirm')
+      .setColor(0xFFA000)
+      .setDescription([
+        `You get **${fmt(amount)}** now and owe **${fmt(owed)}** back (**${LOAN_INTEREST_PCT}% interest**).`,
+        '',
+        '⚠️ **Heads up:**',
+        `• You have **7 days** to repay with \`/loan repay\` (all at once or in parts).`,
+        '• If it\'s still unpaid after 7 days, the bot **takes what you owe from your balance automatically** — as much as you have, checked every hour until it\'s paid.',
+        '• Only one loan at a time.',
+        '• This is separate from `/daily` — your daily claim isn\'t touched.',
+      ].join('\n'))
+      .setFooter({ text: 'This offer expires in 2 minutes.' });
+    const row = new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId(`loan_confirm_${offerId}`).setLabel(`Borrow ${amount}`).setStyle(ButtonStyle.Success),
+      new ButtonBuilder().setCustomId(`loan_cancel_${offerId}`).setLabel('Cancel').setStyle(ButtonStyle.Secondary),
+    );
+    await interaction.reply({ embeds: [embed], components: [row], ephemeral: true });
+    return;
+  }
+
+  if (interaction.commandName === 'pet-rename') {
+    const id = interaction.options.getInteger('id', true);
+    const pet = getPet(id);
+    if (!pet || pet.user_id !== interaction.user.id) { await interaction.reply({ content: 'You don\'t own a pet with that ID.', ephemeral: true }); return; }
+    const raw = interaction.options.getString('name');
+    const nick = cleanNickname(raw);
+    const catalog = petByKey(pet.pet_key);
+    if (raw && !nick) { await interaction.reply({ content: 'That name has nothing usable left after removing special characters — try another.', ephemeral: true }); return; }
+    db.prepare('UPDATE pets SET nickname = ? WHERE id = ?').run(nick || null, id);
+    await interaction.reply(nick
+      ? `${catalog.emoji} Your ${catalog.name} (#${id}) is now called **${nick}**.`
+      : `${catalog.emoji} Removed the nickname from your ${catalog.name} (#${id}).`);
+    return;
+  }
+
+  if (interaction.commandName === 'heist') {
+    const target = interaction.options.getUser('target', true);
+    const uid = interaction.user.id;
+    if (target.bot) { await interaction.reply({ content: 'Bots don\'t have banks.', ephemeral: true }); return; }
+    if (inAnyHeist(uid)) { await interaction.reply({ content: 'You\'re already part of a heist (or being targeted by one).', ephemeral: true }); return; }
+    if (inAnyHeist(target.id)) { await interaction.reply({ content: 'Someone is already planning something on them.', ephemeral: true }); return; }
+    const problem = heistMemberProblem(uid, target.id) || heistTargetProblem(target.id);
+    if (problem) { await interaction.reply({ content: problem, ephemeral: true }); return; }
+    const id = Math.random().toString(36).slice(2, 10);
+    const h = { leaderId: uid, targetId: target.id, crew: [uid], channelId: interaction.channelId, messageId: null, expires: Date.now() + HEIST_LOBBY_MS, timer: null };
+    heists.set(id, h);
+    await interaction.reply({ embeds: [heistLobbyEmbed(h)], components: [heistButtons(id)] });
+    const msg = await interaction.fetchReply();
+    h.messageId = msg.id;
+    h.timer = setTimeout(() => runHeist(id, 'timeout').catch(e => console.error('heist run failed', e)), HEIST_LOBBY_MS);
+    return;
+  }
+
+  if (interaction.commandName === 'bank') {
+    const sub = interaction.options.getSubcommand();
+    const uid = interaction.user.id;
+    const amount = sub === 'view' ? null : interaction.options.getInteger('amount');
+    let line = '';
+    if (sub === 'deposit') {
+      const moved = bankDeposit(uid, amount ?? undefined);
+      line = moved > 0 ? `🏦 Deposited ${fmt(moved)}.` : 'Nothing in your wallet to deposit.';
+    } else if (sub === 'withdraw') {
+      const moved = bankWithdraw(uid, amount ?? undefined);
+      line = moved > 0 ? `🏦 Withdrew ${fmt(moved)}.` : 'Your bank is empty.';
+    }
+    const u = getUser(uid);
+    const embed = new EmbedBuilder()
+      .setTitle('🏦 Bank')
+      .setColor(0x1E88E5)
+      .setDescription([line, `👛 Wallet: **${fmt(u.balance)}** — can be robbed`, `🏦 Bank: **${fmt(u.bank)}** — safe from /rob`].filter(Boolean).join('\n'));
+    await interaction.reply({ embeds: [embed], ephemeral: true });
+    return;
+  }
+
+  if (interaction.commandName === 'rob') {
+    const target = interaction.options.getUser('user', true);
+    if (target.bot) { await interaction.reply({ content: 'Bots don\'t carry coins.', ephemeral: true }); return; }
+    const problem = robProblem(interaction.user.id, target.id);
+    if (problem) { await interaction.reply({ content: problem, ephemeral: true }); return; }
+    const r = resolveRob(interaction.user.id, target.id);
+    const robber = interaction.user;
+    let title, desc, color;
+    if (r.success) {
+      title = '💰 Robbery!';
+      desc = `${robber} robbed ${target} and got away with **${fmt(r.stolen)}**!${r.usedLockpick ? '\n🗝️ A lockpick helped.' : ''}`;
+      color = 0x4CAF50;
+    } else {
+      const who = r.usedMask ? 'A masked robber 🎭' : `${robber}`;
+      title = r.blockedByPadlock ? '🔒 Blocked by a padlock!' : '🚨 Caught!';
+      desc = `${who} tried to rob ${target} ${r.blockedByPadlock ? 'but their padlock held' : 'and got caught'} — paid them **${fmt(r.fine)}** in fines.`;
+      color = 0xE53935;
+    }
+    const embed = new EmbedBuilder().setTitle(title).setDescription(desc).setColor(color);
+    if (!r.success && r.usedMask) {
+      // victim sees an anonymous public message; the robber gets the details privately
+      await interaction.reply({ content: `🎭 You got caught robbing ${target.username}, but your mask hid who you were. You paid ${fmt(r.fine)}.`, ephemeral: true });
+      try { await interaction.channel.send({ content: `${target}`, embeds: [embed] }); } catch (e) { console.error('rob notice failed', e.message); }
+      return;
+    }
+    await interaction.reply({ content: `${target}`, embeds: [embed] });
+    return;
+  }
+
+  if (interaction.commandName === 'stocks') {
+    const uid = interaction.user.id;
+    const remaining = getJobCooldownRemaining(uid, 'stocks', STOCKS_COOLDOWN_MS);
+    if (remaining > 0) { await interaction.reply({ content: `📱 Markets are closed for you — check again in ${fmtDuration(remaining)}.`, ephemeral: true }); return; }
+    setJobCooldown(uid, 'stocks');
+    const outcome = rollStocks();
+    const coins = outcome.coins();
+    if (coins > 0) addBalance(uid, coins);
+    const embed = new EmbedBuilder()
+      .setTitle(`📱 Stocks — ${outcome.title}`)
+      .setDescription(`${outcome.text}\n\n${coins > 0 ? `**+${fmt(coins)}**` : 'No change today.'}`)
+      .setColor(coins >= 10000 ? 0xB388FF : coins >= 1000 ? 0xFFD700 : coins > 0 ? 0x4CAF50 : 0x9E9E9E)
+      .setFooter({ text: `Balance: ${getUser(uid).balance.toLocaleString()} · next check in 24h` });
+    await interaction.reply({ embeds: [embed] });
+    return;
+  }
+
   if (interaction.commandName === 'balance') {
     const target = interaction.options.getUser('user') || interaction.user;
     const row = getUser(target.id);
@@ -1577,6 +2148,7 @@ client.on('interactionCreate', async (interaction) => {
 
   if (interaction.commandName === 'roulette') {
     const amount = interaction.options.getInteger('amount', true);
+    if (amount > HOUSE_MAX_BET) { await interaction.reply({ content: `Max bet is ${fmt(HOUSE_MAX_BET)}.`, ephemeral: true }); return; }
     const betType = interaction.options.getString('bet_type', true);
     const valueRaw = interaction.options.getString('value', true).toLowerCase().trim();
     const user = getUser(interaction.user.id);
@@ -1585,13 +2157,14 @@ client.on('interactionCreate', async (interaction) => {
     if (!validateRouletteBet(betType, valueRaw)) { await interaction.reply({ content: `Invalid value "${valueRaw}" for bet type "${betType}".`, ephemeral: true }); return; }
 
     addBalance(interaction.user.id, -amount);
-    const result = spinRoulette();
+    let result = spinRoulette();
+    if (!evaluateRouletteBet(betType, valueRaw, result).won && ownerSecondChance(interaction.user.id)) result = spinRoulette();
     const color = rouletteColor(result);
     const { won, payoutMultiplier } = evaluateRouletteBet(betType, valueRaw, result);
 
     const buff = getActiveBuff(interaction.user.id);
     let winnings = 0;
-    if (won) { winnings = applyBuff(amount * payoutMultiplier, buff.win); addBalance(interaction.user.id, winnings); }
+    if (won) { winnings = housePayout(amount, payoutMultiplier, buff.win); addBalance(interaction.user.id, winnings); }
     const newBalance = getUser(interaction.user.id).balance;
 
     const colorEmoji = color === 'red' ? '🔴' : color === 'black' ? '⚫' : '🟢';
@@ -1715,7 +2288,7 @@ client.on('interactionCreate', async (interaction) => {
   if (interaction.commandName === 'leaderboard') {
     await interaction.deferReply();
     const members = await interaction.guild.members.fetch();
-    const rows = db.prepare('SELECT user_id, balance FROM users ORDER BY balance DESC').all();
+    const rows = db.prepare('SELECT user_id, balance + bank AS balance FROM users ORDER BY balance + bank DESC').all();
     const ranked = rows.filter(r => members.has(r.user_id)).slice(0, 10);
     if (!ranked.length) { await interaction.editReply('Nobody has any balance yet — try `/daily`.'); return; }
     const medals = ['🥇', '🥈', '🥉'];
@@ -1763,15 +2336,17 @@ client.on('interactionCreate', async (interaction) => {
 
   if (interaction.commandName === 'coinflip') {
     const amount = interaction.options.getInteger('amount', true);
+    if (amount > HOUSE_MAX_BET) { await interaction.reply({ content: `Max bet is ${fmt(HOUSE_MAX_BET)}.`, ephemeral: true }); return; }
     const call = interaction.options.getString('call', true);
     const user = getUser(interaction.user.id);
     if (user.balance < amount) { await interaction.reply({ content: `You only have ${fmt(user.balance)}.`, ephemeral: true }); return; }
 
     addBalance(interaction.user.id, -amount);
-    const result = Math.random() < 0.5 ? 'heads' : 'tails';
+    let result = Math.random() < 0.5 ? 'heads' : 'tails';
+    if (result !== call && ownerSecondChance(interaction.user.id)) result = Math.random() < 0.5 ? 'heads' : 'tails';
     const won = result === call;
     const buff = getActiveBuff(interaction.user.id);
-    const payout = won ? applyBuff(amount * 2, buff.win) : 0;
+    const payout = won ? housePayout(amount, 1.95, buff.win) : 0;
     if (won) addBalance(interaction.user.id, payout);
     const newBalance = getUser(interaction.user.id).balance;
 
@@ -1789,18 +2364,21 @@ client.on('interactionCreate', async (interaction) => {
 
   if (interaction.commandName === 'slots') {
     const amount = interaction.options.getInteger('amount', true);
+    if (amount > HOUSE_MAX_BET) { await interaction.reply({ content: `Max bet is ${fmt(HOUSE_MAX_BET)}.`, ephemeral: true }); return; }
     const user = getUser(interaction.user.id);
     if (user.balance < amount) { await interaction.reply({ content: `You only have ${fmt(user.balance)}.`, ephemeral: true }); return; }
 
     addBalance(interaction.user.id, -amount);
-    const reels = [spinReel(), spinReel(), spinReel()];
+    let reels = [spinReel(), spinReel(), spinReel()];
+    const notJackpot = r => !(r[0].emoji === r[1].emoji && r[1].emoji === r[2].emoji);
+    if (notJackpot(reels) && ownerSecondChance(interaction.user.id)) reels = [spinReel(), spinReel(), spinReel()];
     const [a, b, c] = reels;
 
     const buff = getActiveBuff(interaction.user.id);
     let winnings = 0;
     let outcome = 'lose';
     if (a.emoji === b.emoji && b.emoji === c.emoji) {
-      winnings = applyBuff(amount * a.payout, buff.win);
+      winnings = housePayout(amount, a.payout, buff.win);
       outcome = 'jackpot';
       trackQuest(interaction.user.id, 'slots_jackpot');
     } else if (a.emoji === b.emoji || b.emoji === c.emoji || a.emoji === c.emoji) {
@@ -1824,6 +2402,7 @@ client.on('interactionCreate', async (interaction) => {
 
   if (interaction.commandName === 'blackjack') {
     const amount = interaction.options.getInteger('amount', true);
+    if (amount > HOUSE_MAX_BET) { await interaction.reply({ content: `Max bet is ${fmt(HOUSE_MAX_BET)}.`, ephemeral: true }); return; }
     const user = getUser(interaction.user.id);
     if (user.balance < amount) { await interaction.reply({ content: `You only have ${fmt(user.balance)}.`, ephemeral: true }); return; }
     if (blackjackGames.has(interaction.user.id)) { await interaction.reply({ content: 'You already have a game in progress.', ephemeral: true }); return; }
@@ -1843,7 +2422,7 @@ client.on('interactionCreate', async (interaction) => {
       if (playerBJ && dealerBJ) { result = 'push'; addBalance(interaction.user.id, amount); }
       else if (playerBJ) {
         result = 'win';
-        addBalance(interaction.user.id, applyBuff(Math.floor(amount * 2.5), naturalBuff.win));
+        addBalance(interaction.user.id, housePayout(amount, 2.5, naturalBuff.win));
         db.prepare('UPDATE users SET blackjack_wins = blackjack_wins + 1 WHERE user_id = ?').run(interaction.user.id);
         trackQuest(interaction.user.id, 'blackjack_win');
         checkAchievements(interaction.user.id);
@@ -1940,7 +2519,7 @@ client.on('interactionCreate', async (interaction) => {
     const lines = enriched.map(p => {
       const skinPrefix = p.skin_key ? `${skinByKey(p.skin_key).emoji} ` : '';
       const namePart = `${skinPrefix}${p.evolved ? '⚡ ' : ''}${p.catalog.name}`;
-      return `${activeIds.has(p.id) ? '⭐' : '#' + p.id} ${p.catalog.emoji} **${namePart}** (${p.catalog.rarity}) — Lv.${p.level}${activeIds.has(p.id) ? ' *(active)*' : ''}`;
+      return `${activeIds.has(p.id) ? '⭐' : '#' + p.id} ${p.catalog.emoji} **${withNick(p, namePart)}** (${p.catalog.rarity}) — Lv.${p.level}${activeIds.has(p.id) ? ' *(active)*' : ''}`;
     });
     const chunks = [];
     let cur = [], len = 0;
@@ -1978,7 +2557,7 @@ client.on('interactionCreate', async (interaction) => {
     };
     const hasBonus = pet.bonus_xp || pet.bonus_coin || pet.bonus_win;
     const skinPrefix = pet.skin_key ? `${skinByKey(pet.skin_key).emoji} ` : '';
-    const displayName = `${skinPrefix}${pet.evolved ? evolvedName(catalog) : catalog.name}`;
+    const displayName = withNick(pet, `${skinPrefix}${pet.evolved ? evolvedName(catalog) : catalog.name}`);
     const evolveNote = pet.evolved
       ? 'Evolved ⚡'
       : pet.level >= EVOLVE_LEVEL
@@ -2324,6 +2903,8 @@ client.on('interactionCreate', async (interaction) => {
     const boostLines = boosts.length
       ? boosts.map(b => {
           const mins = Math.max(0, Math.ceil((b.expires_at - Date.now()) / 60000));
+          if (b.stat === 'guard') return `🐕 Guard Dog (-${b.value}% rob odds) — ${mins}m left`;
+          if (b.stat === 'vault') return `🚨 Vault Alarm (-${b.value}% heist odds) — ${Math.floor(mins / 60)}h ${mins % 60}m left`;
           return `+${b.value}% ${b.stat} — ${mins}m left`;
         })
       : ['*none active*'];
@@ -2331,7 +2912,7 @@ client.on('interactionCreate', async (interaction) => {
     const petLines = activePets.length
       ? activePets.map(a => {
           const c = petByKey(a.pet.pet_key);
-          return `Slot ${a.slot_index}: ${c.emoji} ${c.name} (#${a.pet_id})`;
+          return `Slot ${a.slot_index}: ${c.emoji} ${withNick(a.pet, c.name)} (#${a.pet_id})`;
         })
       : ['*none equipped*'];
 
@@ -2339,6 +2920,10 @@ client.on('interactionCreate', async (interaction) => {
     if (user.perm_daily_bonus > 0) upgradeLines.push(`Daily Booster: +${user.perm_daily_bonus}%`);
     if (user.perm_xp_cd_reduction > 0) upgradeLines.push(`Faster Grind: -${user.perm_xp_cd_reduction / 1000}s XP cooldown`);
     if (user.pending_luck_charm) upgradeLines.push(`🍀 Luck Charm ready — applies to your next chest`);
+    for (const [key, label] of [['padlock', '🔒 Padlock'], ['lockpick', '🗝️ Lockpick'], ['mask', '🎭 Mask'], ['heist_kit', '🧤 Heist Kit'], ['drill', '🔩 Drill'], ['laptop', '💻 Hacking Laptop']]) {
+      const n = getRobItem(interaction.user.id, key);
+      if (n > 0) upgradeLines.push(`${label} ×${n}`);
+    }
     if (!upgradeLines.length) upgradeLines.push('*none*');
 
     const embed = new EmbedBuilder()
@@ -2349,7 +2934,7 @@ client.on('interactionCreate', async (interaction) => {
         { name: 'Active Boosts', value: boostLines.join('\n') },
         { name: `Pet Slots (${activePets.length}/${user.pet_slots})`, value: petLines.join('\n') },
         { name: 'Upgrades & Charms', value: upgradeLines.join('\n') },
-        { name: 'Balance', value: `${fmt(user.balance)}\n${fmtCandy(user.candy)}` },
+        { name: 'Balance', value: `👛 ${fmt(user.balance)}\n🏦 ${fmt(user.bank)} in the bank\n${fmtCandy(user.candy)}` },
       )
       .setFooter({ text: '/shop to buy · /pet-equip to change active pets' });
     await interaction.reply({ embeds: [embed] });
@@ -2428,6 +3013,10 @@ async function checkDoubleLootTrigger() {
   }
 }
 
+client.on('guildCreate', (guild) => {
+  registerCommands(guild.id).catch(e => console.error(`Command registration failed for ${guild.name}:`, e.message));
+});
+
 client.once('ready', async () => {
   console.log(`Logged in as ${client.user.tag}`);
   try {
@@ -2436,13 +3025,40 @@ client.once('ready', async () => {
     console.error('Command registration failed:', e.message);
   }
   setInterval(checkDoubleLootTrigger, DOUBLE_LOOT_CHECK_MS);
+  collectOverdueLoans();
+  setInterval(collectOverdueLoans, 60 * 60 * 1000);
+  await postPendingAnnouncement();
 });
 
-// client.login(process.env.DISCORD_TOKEN); // DISABLED — this is a test harness, never connects to Discord
-
-
+// Drop an announce.json next to index.js and restart: the bot posts it as an embed in every
+// server's #bot channel once, then renames the file so it never posts twice.
+async function postPendingAnnouncement() {
+  const fs = require('fs');
+  const file = path.join(__dirname, 'announce.json');
+  if (!fs.existsSync(file)) return;
+  let data;
+  try { data = JSON.parse(fs.readFileSync(file, 'utf8')); } catch (e) { console.error('announce.json unreadable:', e.message); return; }
+  fs.renameSync(file, path.join(__dirname, `announce.posted-${Date.now()}.json`));
+  const embed = new EmbedBuilder().setTitle(data.title).setDescription(data.description || null).setColor(data.color ?? 0xFFD700).setTimestamp(new Date());
+  for (const f of data.fields || []) embed.addFields({ name: f.name, value: f.value, inline: !!f.inline });
+  if (data.footer) embed.setFooter({ text: data.footer });
+  for (const guild of client.guilds.cache.values()) {
+    try {
+      const channels = await guild.channels.fetch();
+      const names = data.channel ? [data.channel] : ['bot', 'economy'];
+      const ch = names.map(n => channels.find(c => c && c.isTextBased && c.isTextBased() && c.name === n)).find(Boolean);
+      if (!ch) { console.log(`announce: no #${data.channel || 'bot'} in ${guild.name}`); continue; }
+      await ch.send({ embeds: [embed] });
+      console.log(`announce: posted in ${guild.name} #${ch.name}`);
+    } catch (e) { console.error(`announce failed in ${guild.name}:`, e.message); }
+  }
+}
 
 module.exports = {
+  heistMemberProblem, heistTargetProblem, heistStartProblem, resolveHeist,
+  housePayout, houseWinBonus, evaluateRouletteBet,
+  bankDeposit, bankWithdraw, robProblem, resolveRob, getRobItem, addRobItem, addBoost, ROB_COOLDOWN_MS,
+  getLoan, takeLoan, repayLoan, collectOverdueLoans, loanOwedFor, LOAN_MAX, rollStocks, STOCK_OUTCOMES, cleanNickname, withNick,
   battleProblem, resolveBattle,
   db, getUser, addBalance, addCandy, fmt, fmtCandy,
   xpForNextLevel, levelFromTotalXp, progressBar, awardXp,
